@@ -162,6 +162,11 @@ def get_back_keyboard():
 async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global afk_mode
     
+    # === Получаем business_connection_id (для Business Mode) ===
+    business_connection_id = update.business_connection_id
+    if business_connection_id:
+        logging.info(f"Business connection ID: {business_connection_id}")
+    
     # === ЗАЩИТА: если нет сообщения (например, callback) — выходим ===
     if update.message is None:
         return
@@ -169,6 +174,7 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     
+    # Если сообщение от админа — игнорируем
     if user_id == ADMIN_ID:
         return
 
@@ -190,13 +196,17 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=user_id,
                     message_id=last_msg_id,
                     text=reply_text,
-                    reply_markup=get_main_keyboard()
+                    reply_markup=get_main_keyboard(),
+                    business_connection_id=business_connection_id
                 )
                 return
             except:
                 pass
 
-        msg = await update.message.reply_text(reply_text, reply_markup=get_main_keyboard())
+        msg = await update.message.reply_text(
+            reply_text,
+            reply_markup=get_main_keyboard()
+        )
         context.user_data[f'last_msg_{user_id}'] = msg.message_id
         return
 
@@ -252,7 +262,8 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 message_id=last_msg_id,
                 text=reply_text,
-                reply_markup=keyboard
+                reply_markup=keyboard,
+                business_connection_id=business_connection_id
             )
             return
         except:
@@ -273,6 +284,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
     temp_id = context.user_data.get(f'temp_msg_{user_id}')
+    
+    # Получаем business_connection_id (для Business Mode)
+    business_connection_id = update.business_connection_id
 
     if data == "rules":
         text = (
@@ -282,9 +296,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Минимальная комиссия: 150 ₽"
         )
         if temp_id:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
         else:
-            msg = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            msg = await query.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
             context.user_data[f'temp_msg_{user_id}'] = msg.message_id
 
     elif data == "schedule":
@@ -296,9 +318,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Заявки вне рабочего времени — на следующий день."
         )
         if temp_id:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
         else:
-            msg = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            msg = await query.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
             context.user_data[f'temp_msg_{user_id}'] = msg.message_id
 
     elif data == "profile":
@@ -315,9 +345,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "👤 У вас пока нет завершённых сделок."
 
         if temp_id:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
         else:
-            msg = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+            msg = await query.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard()
+            )
             context.user_data[f'temp_msg_{user_id}'] = msg.message_id
 
     elif data == "links":
@@ -328,15 +366,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 💬 Чат клиентов: https://t.me/ваш_чат"
         )
         if temp_id:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard(), disable_web_page_preview=True)
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard(),
+                disable_web_page_preview=True
+            )
         else:
-            msg = await query.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard(), disable_web_page_preview=True)
+            msg = await query.message.reply_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=get_back_keyboard(),
+                disable_web_page_preview=True
+            )
             context.user_data[f'temp_msg_{user_id}'] = msg.message_id
 
     elif data == "back":
         if temp_id:
             try:
-                await context.bot.delete_message(chat_id=user_id, message_id=temp_id)
+                await context.bot.delete_message(
+                    chat_id=user_id,
+                    message_id=temp_id
+                )
             except:
                 pass
             context.user_data[f'temp_msg_{user_id}'] = None
@@ -345,6 +396,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================================
 # ================== КОМАНДЫ =======================
 # ==================================================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    
+    if user_id == ADMIN_ID:
+        await update.message.reply_text("👋 Привет, хозяин! Бот работает.")
+        return
+    
+    await update.message.reply_text(
+        "👋 Добро пожаловать!\n\n"
+        "Я помогу вам обменять рубли на USDT.\n"
+        "Просто напишите сумму, например: 5000"
+    )
+
 
 async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global afk_mode
@@ -462,13 +528,18 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
-    app.add_handler(CallbackQueryHandler(button_callback))
+    # Команды
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("afk", afk_command))
     app.add_handler(CommandHandler("complete", complete_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    
+    # Обработчики сообщений и кнопок
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-    print("✅ Бот запущен. Режим: автоответчик в личных чатах.")
+    print("✅ Бот запущен. Режим: Business Mode (секретарь).")
+    print("✅ Поддерживается business_connection_id для ответов в бизнес-чатах.")
     app.run_polling()
 
 
