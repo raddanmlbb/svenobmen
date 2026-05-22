@@ -161,6 +161,11 @@ def get_back_keyboard():
 
 async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global afk_mode
+    
+    # === ЗАЩИТА: если нет сообщения (например, callback) — выходим ===
+    if update.message is None:
+        return
+    
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     
