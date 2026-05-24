@@ -430,6 +430,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard()
     )
 
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+    await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
+
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
@@ -473,8 +479,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_banned_users(update, context)
     elif text == "◀️ ВЫЙТИ" and update.effective_user.id == ADMIN_ID:
         await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
-    elif text == "/admin" and update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None):
     if user_id is None:
@@ -573,7 +577,7 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = await context.bot.get_chat(req[1])
         username = user.username or str(req[1])
         text += f"#{req[0]} | @{username} | {req[2]:.0f} ₽ | {req[5][:16]}\n"
-    text += "\n➡️ /take <id> — взять в работу\n➡️ /send <id> <текст> — отправить реквизиты\n➡️ /cancel <id> — отклонить\n➡️ /ban <@username> <причина> — заблокировать"
+    text += "\n➡️ /take <id> — взять в работу\n➡️ /send <id> <текст> — отправить реквизиты\n➡️ /confirm <id> — подтвердить оплату\n➡️ /reject <id> — отклонить\n➡️ /cancel <id> — отменить заявку\n➡️ /ban @username <причина> — заблокировать"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -744,7 +748,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
-    # Пропускаем команды
+    # Пропускаем команды (они обрабатываются CommandHandler)
     if text.startswith('/'):
         return
     
@@ -869,12 +873,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================================================
 # ================== КОМАНДЫ АДМИНА ================
 # ==================================================
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-    await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
 
 async def take_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -1045,6 +1043,31 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_keyboard()
     )
 
+async def cancel_request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❌ /cancel <id>")
+        return
+    try:
+        request_id = int(args[0])
+    except:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    request = db.get_request(request_id)
+    if not request:
+        await update.message.reply_text(f"❌ Заявка #{request_id} не найдена")
+        return
+    db.cancel_request(request_id, "admin")
+    await update.message.reply_text(f"✅ Заявка #{request_id} отменена")
+    await context.bot.send_message(
+        request[1],
+        f"❌ **ЗАЯВКА #{request_id} ОТМЕНЕНА АДМИНИСТРАТОРОМ.**\n\n"
+        f"Вы можете создать новую заявку: /start",
+        reply_markup=get_main_keyboard()
+    )
+
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['awaiting_feedback'] = False
     context.user_data['rating_request_id'] = None
@@ -1136,6 +1159,7 @@ def main():
     app.add_handler(CommandHandler("send", send_command))
     app.add_handler(CommandHandler("confirm", confirm_command))
     app.add_handler(CommandHandler("reject", reject_command))
+    app.add_handler(CommandHandler("cancel", cancel_request_command))
     app.add_handler(CommandHandler("ban", ban_command))
     app.add_handler(CommandHandler("unban", unban_command))
     app.add_handler(CommandHandler("afk", afk_command))
@@ -1151,6 +1175,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_edit))
     
     print("✅ БОТ ЗАПУЩЕН. SVEN OBMEN")
+    print(f"👤 АДМИН: {ADMIN_ID}")
     app.run_polling()
 
 
