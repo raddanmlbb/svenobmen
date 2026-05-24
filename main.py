@@ -4,10 +4,10 @@ import sqlite3
 import aiohttp
 import json
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, MessageHandler, filters, CommandHandler,
-    CallbackQueryHandler, ContextTypes, ConversationHandler
+    CallbackQueryHandler, ContextTypes
 )
 
 # ==================================================
@@ -114,7 +114,6 @@ class Database:
             self.cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
         self.conn.commit()
 
-    # Клиенты
     def add_client(self, user_id, username):
         now = datetime.now().isoformat()
         self.cursor.execute(
@@ -178,7 +177,6 @@ class Database:
         row = self.cursor.fetchone()
         return row[0] if row else None
     
-    # Заявки
     def add_request(self, user_id, operation_type, amount, client_total):
         now = datetime.now().isoformat()
         self.cursor.execute("""
@@ -208,16 +206,6 @@ class Database:
     
     def get_all_active_requests(self):
         return self.get_all_requests_by_status(STATUS_PENDING)
-    
-    def update_request_status(self, request_id, status, extra_field=None, extra_value=None):
-        if extra_field and extra_value:
-            self.cursor.execute(
-                f"UPDATE requests SET status = ?, {extra_field} = ? WHERE id = ?",
-                (status, extra_value, request_id)
-            )
-        else:
-            self.cursor.execute("UPDATE requests SET status = ? WHERE id = ?", (status, request_id))
-        self.conn.commit()
     
     def take_request(self, request_id):
         now = datetime.now().isoformat()
@@ -261,7 +249,6 @@ class Database:
         )
         self.conn.commit()
     
-    # Отзывы
     def add_feedback(self, user_id, request_id, rating=None, comment=None):
         now = datetime.now().isoformat()
         self.cursor.execute(
@@ -297,7 +284,6 @@ class Database:
         avg = self.cursor.fetchone()[0]
         return avg if avg else 0
     
-    # Настройки
     def get_setting(self, key):
         self.cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = self.cursor.fetchone()
@@ -587,7 +573,7 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = await context.bot.get_chat(req[1])
         username = user.username or str(req[1])
         text += f"#{req[0]} | @{username} | {req[2]:.0f} ₽ | {req[5][:16]}\n"
-    text += "\n➡️ /take <id> — взять в работу\n➡️ /send <id> <текст> — отправить реквизиты\n➡️ /cancel <id> — отклонить\n➡️ /ban <id> <причина> — заблокировать"
+    text += "\n➡️ /take <id> — взять в работу\n➡️ /send <id> <текст> — отправить реквизиты\n➡️ /cancel <id> — отклонить\n➡️ /ban <@username> <причина> — заблокировать"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
