@@ -454,25 +454,50 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💰 ВЫБЕРИТЕ ТИП ОПЕРАЦИИ:",
             reply_markup=get_operation_keyboard()
         )
+        return
+    
     elif text == "⭐ ОТЗЫВЫ КЛИЕНТОВ":
         await show_reviews(update, context)
+        return
+    
     elif text == "📜 ПРАВИЛА":
         rules = db.get_setting('rules')
         await update.message.reply_text(rules, parse_mode="Markdown", reply_markup=get_main_keyboard())
+        return
+    
     elif text == "👤 ПРОФИЛЬ":
         await show_profile(update, context, user_id)
+        return
+    
     elif text == "📋 ЗАЯВКИ" and update.effective_user.id == ADMIN_ID:
         await show_requests_list(update, context)
+        return
+    
     elif text == "⚙️ НАСТРОЙКИ" and update.effective_user.id == ADMIN_ID:
         await show_settings(update, context)
+        return
+    
     elif text == "📊 СТАТИСТИКА" and update.effective_user.id == ADMIN_ID:
         await show_admin_stats(update, context)
+        return
+    
     elif text == "🚫 ЗАБАНЕННЫЕ" and update.effective_user.id == ADMIN_ID:
         await show_banned_users(update, context)
+        return
+    
     elif text == "◀️ ВЫЙТИ" and update.effective_user.id == ADMIN_ID:
         await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
+        return
+    
     elif text == "/admin" and update.effective_user.id == ADMIN_ID:
         await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
+        return
+    
+    # Если ничего не подошло
+    await update.message.reply_text(
+        "Используйте кнопки меню для навигации.",
+        reply_markup=get_main_keyboard()
+    )
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int = None):
     if user_id is None:
@@ -562,16 +587,28 @@ async def show_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    
     requests = db.get_all_active_requests()
+    
     if not requests:
-        await update.message.reply_text("📋 НЕТ АКТИВНЫХ ЗАЯВОК.", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(
+            "📋 НЕТ АКТИВНЫХ ЗАЯВОК.\n\n"
+            "Создайте заявку через клиентскую часть.",
+            reply_markup=get_admin_keyboard()
+        )
         return
+    
     text = "📋 **ЗАЯВКИ В ОЖИДАНИИ:**\n\n"
     for req in requests:
-        user = await context.bot.get_chat(req[1])
-        username = user.username or str(req[1])
+        try:
+            user = await context.bot.get_chat(req[1])
+            username = user.username or str(req[1])
+        except:
+            username = str(req[1])
         text += f"#{req[0]} | @{username} | {req[2]:.0f} ₽ | {req[5][:16]}\n"
+    
     text += "\n➡️ /take <id> — взять в работу\n➡️ /send <id> <текст> — отправить реквизиты\n➡️ /cancel <id> — отклонить\n➡️ /ban <id> <причина> — заблокировать"
+    
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1204,7 +1241,7 @@ def main():
     # Callback обработчик
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Единый обработчик сообщений (обрабатывает всё)
+    # Единый обработчик сообщений
     app.add_handler(MessageHandler(filters.ALL, handle_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_edit))
     
