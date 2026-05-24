@@ -197,7 +197,7 @@ class Database:
         )
         return self.cursor.fetchone()
     
-    def get_all_active_requests(self):
+    def get_all_pending_requests(self):
         self.cursor.execute(
             "SELECT id, user_id, amount, client_total, status, created_at FROM requests WHERE status = ? ORDER BY created_at DESC",
             (STATUS_PENDING,)
@@ -448,6 +448,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Клиентские кнопки
     if text == "🔥 НОВЫЙ ЗАПРОС":
         active = db.get_user_active_request(user_id)
         if active:
@@ -476,27 +477,26 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_profile(update, context, user_id)
         return
     
-    elif text == "📋 ЗАЯВКИ" and update.effective_user.id == ADMIN_ID:
-        await show_requests_list(update, context)
-        return
+    # Админские кнопки (только для ADMIN_ID)
+    elif user_id == ADMIN_ID:
+        if text == "📋 ЗАЯВКИ":
+            await show_requests_list(update, context)
+            return
+        elif text == "⚙️ НАСТРОЙКИ":
+            await show_settings(update, context)
+            return
+        elif text == "📊 СТАТИСТИКА":
+            await show_admin_stats(update, context)
+            return
+        elif text == "🚫 ЗАБАНЕННЫЕ":
+            await show_banned_users(update, context)
+            return
+        elif text == "◀️ ВЫЙТИ":
+            await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
+            return
     
-    elif text == "⚙️ НАСТРОЙКИ" and update.effective_user.id == ADMIN_ID:
-        await show_settings(update, context)
-        return
-    
-    elif text == "📊 СТАТИСТИКА" and update.effective_user.id == ADMIN_ID:
-        await show_admin_stats(update, context)
-        return
-    
-    elif text == "🚫 ЗАБАНЕННЫЕ" and update.effective_user.id == ADMIN_ID:
-        await show_banned_users(update, context)
-        return
-    
-    elif text == "◀️ ВЫЙТИ" and update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
-        return
-    
-    elif text == "/admin" and update.effective_user.id == ADMIN_ID:
+    # Команда /admin (для тех случаев, когда нет кнопки)
+    elif text == "/admin" and user_id == ADMIN_ID:
         await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
         return
     
@@ -595,7 +595,7 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if update.effective_user.id != ADMIN_ID:
         return
     
-    pending_requests = db.get_all_active_requests()
+    pending_requests = db.get_all_pending_requests()
     processing_requests = db.get_all_processing_requests()
     
     if not pending_requests and not processing_requests:
@@ -633,7 +633,7 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text += "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     text += "➡️ /take <id> — взять в работу\n"
     text += "➡️ /send <id> <текст> — отправить реквизиты\n"
-    text += "➡️ /cancel <id> — отклонить\n"
+    text += "➡️ /reject <id> — отклонить\n"
     text += "➡️ /ban @username <причина> — заблокировать"
     
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
@@ -812,12 +812,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
     user_id = update.effective_user.id
-    text = update.message.text.strip()
     
-    # Пропускаем команды
-    if text.startswith('/'):
-        return
-    
+    # Проверка на бан
     banned, reason = db.is_banned(user_id)
     if banned:
         await update.message.reply_text(
@@ -827,7 +823,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Обработка PDF (ДОЛЖНА БЫТЬ ПЕРВОЙ)
+    # Обработка PDF (должна быть первой среди проверок содержимого)
     if update.message.document:
         if update.message.document.mime_type == 'application/pdf':
             print(f"🔍 Получен PDF от {user_id}")
@@ -880,8 +876,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Обработка ввода суммы
+    # Обработка ввода суммы (ожидание числа)
     if context.user_data.get('awaiting_amount'):
+        text = update.message.text.strip()
         match = re.search(r"(\d+)", text)
         if not match:
             await update.message.reply_text(
@@ -929,7 +926,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Текстовый отзыв
     if context.user_data.get('awaiting_feedback'):
-        comment = text
+        comment = update.message.text.strip()
         request_id = context.user_data.get('rating_request_id')
         if request_id:
             db.add_feedback(user_id, request_id, None, comment)
@@ -945,12 +942,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_main_keyboard()
             )
         return
-    
-    # Если ничего не подошло
-    await update.message.reply_text(
-        "Используйте кнопки меню для навигации.",
-        reply_markup=get_main_keyboard()
-    )
 
 # ==================================================
 # ================== КОМАНДЫ =======================
@@ -1236,8 +1227,12 @@ def main():
     # Callback обработчик
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Обработчики сообщений
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    # Обработчики сообщений (важен порядок!)
+    # Сначала документы (PDF)
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_message))
+    # Потом текстовые сообщения для меню
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    # Потом редактирование настроек
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_edit))
     
     print("✅ БОТ ЗАПУЩЕН. SVEN OBMEN")
