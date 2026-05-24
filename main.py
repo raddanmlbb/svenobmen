@@ -285,7 +285,6 @@ class Database:
         )
 
     def take_request(self, request_id: int) -> bool:
-        """Возвращает True если заявка успешно взята"""
         now = datetime.now().isoformat()
         request = self.get_request(request_id)
         if not request or request['status'] != STATUS_PENDING:
@@ -460,7 +459,6 @@ def get_rank_info(deals: int) -> dict:
                 "deals_to_next": deals_to_next,
                 "progress_percent": int((progress_current / progress_total * 100)) if progress_total > 0 else 100
             }
-    # Если не нашли (маловероятно), возвращаем последний ранг
     last_rank = RANKS[-1]
     return {
         "name": last_rank['name'],
@@ -576,13 +574,26 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка ввода суммы"""
     text = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    # Проверяем, не нажата ли кнопка меню
+    menu_buttons = ["🔥 НОВЫЙ ЗАПРОС", "⭐ ОТЗЫВЫ КЛИЕНТОВ", "📜 ПРАВИЛА", "👤 ПРОФИЛЬ",
+                    "📋 ЗАЯВКИ", "⚙️ НАСТРОЙКИ", "📊 СТАТИСТИКА", "🚫 ЗАБАНЕННЫЕ", "◀️ ВЫЙТИ"]
+    
+    if text in menu_buttons:
+        context.user_data['awaiting_amount'] = False
+        context.user_data['operation_type'] = None
+        await handle_menu(update, context)
+        return
+    
     match = re.search(r"(\d+(?:\.\d+)?)", text)
     
     if not match:
         await update.message.reply_text(
             "❌ Введите число (сумму в рублях).\n\n"
-            "Пример: 3000",
-            reply_markup=get_back_keyboard()
+            "Пример: 3000\n\n"
+            "Или нажмите кнопку меню для отмены.",
+            reply_markup=get_main_keyboard()
         )
         return
     
@@ -591,15 +602,15 @@ async def handle_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         await update.message.reply_text(
             "❌ Некорректное число. Попробуйте еще раз.",
-            reply_markup=get_back_keyboard()
+            reply_markup=get_main_keyboard()
         )
         return
     
     if amount < MIN_AMOUNT:
         await update.message.reply_text(
-            f"❌ Минимальная сумма: {MIN_AMOUNT} ₽\n"
-            f"Пожалуйста, введите сумму не менее {MIN_AMOUNT} ₽",
-            reply_markup=get_back_keyboard()
+            f"❌ Минимальная сумма: {MIN_AMOUNT:,} ₽\n"
+            f"Пожалуйста, введите сумму не менее {MIN_AMOUNT:,} ₽",
+            reply_markup=get_main_keyboard()
         )
         return
     
@@ -607,7 +618,7 @@ async def handle_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             f"❌ Максимальная сумма: {MAX_AMOUNT:,} ₽\n"
             f"Пожалуйста, введите меньшую сумму",
-            reply_markup=get_back_keyboard()
+            reply_markup=get_main_keyboard()
         )
         return
     
@@ -627,6 +638,7 @@ async def handle_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     
     context.user_data['temp_amount'] = amount
+    context.user_data['operation_type'] = op_type
     context.user_data['awaiting_amount'] = False
     
     await update.message.reply_text(
@@ -853,7 +865,6 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     rank_info = get_rank_info(deals)
     progress_bar = get_progress_bar(rank_info['progress_percent'])
     
-    # Проверяем активные заявки
     active_request = db.get_user_active_request(user_id)
     active_text = f"#{active_request['id']} ({active_request['status']})" if active_request else "Нет"
     
@@ -911,7 +922,6 @@ async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append(InlineKeyboardButton("📌 ПОКАЗАТЬ ЕЩЁ", callback_data="reviews_next"))
     kb.append(InlineKeyboardButton("◀️ НАЗАД", callback_data="back_to_main"))
     
-    # Определяем, откуда был вызван показ отзывов
     if hasattr(update, 'callback_query') and update.callback_query:
         await update.callback_query.edit_message_text(
             text,
@@ -1091,6 +1101,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         op_type = data[5:]
         if op_type in operation_mapping:
             context.user_data['operation_type'] = operation_mapping[op_type]
+            context.user_data['awaiting_amount'] = True
             await query.edit_message_text(
                 f"💰 ВВЕДИТЕ СУММУ В РУБЛЯХ\n\n"
                 f"(Напишите число, например: 3000)\n"
@@ -1098,7 +1109,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"◀️ Нажмите «НАЗАД» для отмены",
                 reply_markup=get_back_keyboard("back_to_main")
             )
-            context.user_data['awaiting_amount'] = True
     
     elif data == "edit_amount":
         context.user_data['awaiting_amount'] = True
@@ -1182,7 +1192,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Проверяем, что это заявка текущего пользователя
         if request['user_id'] != user_id:
             await query.answer("Это не ваша заявка!", show_alert=True)
             return
@@ -1202,7 +1211,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_operation_keyboard()
             )
             
-            # Уведомление админу
             try:
                 user = await context.bot.get_chat(user_id)
                 username = get_username_or_id(user)
@@ -1285,7 +1293,6 @@ async def take_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Отправьте реквизиты: /send {request_id} <текст>"
     )
     
-    # Уведомление клиенту
     try:
         await context.bot.send_message(
             request['user_id'],
@@ -1329,7 +1336,6 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Отправка клиенту
     warning = (
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ **НАПОМИНАНИЕ!**\n\n"
@@ -1387,7 +1393,6 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ Заявка #{request_id} завершена")
     
-    # Предлагаем пользователю оставить отзыв
     try:
         await context.bot.send_message(
             request['user_id'],
@@ -1400,7 +1405,7 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_rating_keyboard()
         )
         
-        # Сохраняем context для возможности оставить отзыв
+        # Сохраняем context для конкретного пользователя
         context.user_data['rating_request_id'] = request_id
         context.user_data['awaiting_feedback'] = True
     except Exception as e:
@@ -1618,7 +1623,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать статистику пользователя"""
     user_id = update.effective_user.id
     
-    # Админ может смотреть статистику других пользователей
     if user_id == ADMIN_ID and context.args:
         username = context.args[0].replace("@", "")
         user_data = db.find_user_by_username(username)
@@ -1641,7 +1645,6 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Проверка токена
     if BOT_TOKEN == "ВАШ_ТОКЕН_ОТ_BOTFATHER":
         print("❌ ОШИБКА: Укажите токен бота в переменной BOT_TOKEN!")
         return
