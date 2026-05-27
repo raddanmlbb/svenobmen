@@ -577,7 +577,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⛔ ДОСТУП ЗАБЛОКИРОВАН\nПричина: {reason}")
         return
 
-    # Клиентские кнопки
+    # ========== КЛИЕНТСКИЕ КНОПКИ ==========
     if text == "🔥 НОВЫЙ ЗАПРОС":
         if await is_afk_mode() and user_id != ADMIN_ID:
             await update.message.reply_text("😴 Бот временно не принимает новые заявки.")
@@ -604,7 +604,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_profile(update, context, user_id)
         return
 
-    # Админские кнопки (только для ADMIN_ID)
+    # ========== АДМИНСКИЕ КНОПКИ (ТОЛЬКО ДЛЯ ADMIN_ID) ==========
     if user_id == ADMIN_ID:
         if text == "📋 ЗАЯВКИ":
             await show_requests_list(update, context)
@@ -629,10 +629,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "◀️ ВЫЙТИ":
             await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
             return
-        if text == "/admin":
-            await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
-            return
 
+    # Если ничего не подошло
     await update.message.reply_text("Пожалуйста, используйте кнопки меню.", reply_markup=get_main_keyboard())
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
