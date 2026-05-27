@@ -15,7 +15,6 @@ from telegram.ext import (
     Application, MessageHandler, filters, CommandHandler,
     CallbackQueryHandler, ContextTypes
 )
-from telegram.constants import ParseMode
 from telegram.error import Forbidden
 
 # ==================================================
@@ -34,6 +33,13 @@ STATUS_PAID = "paid"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED_BY_USER = "cancelled_by_user"
 STATUS_CANCELLED_BY_ADMIN = "cancelled_by_admin"
+
+ACTIVE_REQUEST_STATUSES = (
+    STATUS_PENDING,
+    STATUS_PROCESSING,
+    STATUS_REQUISITES_SENT,
+    STATUS_PAID
+)
 
 OPERATION_OXAPAY = "Оплата счёта OxaPay"
 OPERATION_BITPAPA = "Создание чека Bitpapa"
@@ -191,7 +197,8 @@ class Database:
 
     async def is_banned(self, user_id: int) -> Tuple[bool, Optional[str]]:
         rows = await self._run_query(
-            "SELECT is_banned, ban_reason FROM clients WHERE user_id = ?", (user_id,)
+            "SELECT is_banned, ban_reason FROM clients WHERE user_id = ?",
+            (user_id,)
         )
         if rows and rows[0]['is_banned'] == 1:
             return True, rows[0]['ban_reason']
@@ -222,7 +229,8 @@ class Database:
 
     async def get_client_stats(self, user_id: int):
         rows = await self._run_query(
-            "SELECT total_deals, total_volume, avg_rating, ratings_count FROM clients WHERE user_id=?",
+            "SELECT user_id, username, total_deals, total_volume, avg_rating, ratings_count "
+            "FROM clients WHERE user_id=?",
             (user_id,)
         )
         return rows[0] if rows else None
@@ -233,9 +241,18 @@ class Database:
             "WHERE total_deals > 0 ORDER BY total_deals DESC LIMIT 20"
         )
 
+    async def get_top_clients(self, limit: int = 10):
+        return await self._run_query(
+            "SELECT user_id, username, total_deals, total_volume, avg_rating, ratings_count "
+            "FROM clients WHERE total_deals > 0 "
+            "ORDER BY total_deals DESC, total_volume DESC LIMIT ?",
+            (limit,)
+        )
+
     async def find_user_id_by_username(self, username: str) -> Optional[int]:
         rows = await self._run_query(
-            "SELECT user_id FROM clients WHERE username=?", (username,)
+            "SELECT user_id FROM clients WHERE username=?",
+            (username,)
         )
         return rows[0]['user_id'] if rows else None
 
@@ -249,8 +266,41 @@ class Database:
             INSERT INTO requests
                 (user_id, operation_type, amount, client_total, status, created_at, invoice_link)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, operation_type, amount, client_total,
-              STATUS_PENDING, datetime.now().isoformat(), invoice_link))
+        """, (
+            user_id, operation_type, amount, client_total,
+            STATUS_PENDING, datetime.now().isoformat(), invoice_link
+        ))
+
+    async def create_request_if_no_active(
+        self, user_id: int, operation_type: str, amount: float,
+        client_total: float, invoice_link: Optional[str] = None
+    ) -> Optional[int]:
+        async with self._lock:
+            with sqlite3.connect(self.db_file, timeout=10) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id FROM requests
+                    WHERE user_id=? AND status IN (?,?,?,?)
+                    ORDER BY id DESC LIMIT 1
+                """, (
+                    user_id, STATUS_PENDING, STATUS_PROCESSING,
+                    STATUS_REQUISITES_SENT, STATUS_PAID
+                ))
+                active = cur.fetchone()
+                if active:
+                    return None
+
+                cur.execute("""
+                    INSERT INTO requests
+                        (user_id, operation_type, amount, client_total, status, created_at, invoice_link)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id, operation_type, amount, client_total,
+                    STATUS_PENDING, datetime.now().isoformat(), invoice_link
+                ))
+                conn.commit()
+                return cur.lastrowid
 
     async def get_request(self, request_id: int):
         rows = await self._run_query("SELECT * FROM requests WHERE id=?", (request_id,))
@@ -262,8 +312,10 @@ class Database:
             FROM requests
             WHERE user_id=? AND status IN (?,?,?,?)
             ORDER BY id DESC LIMIT 1
-        """, (user_id, STATUS_PENDING, STATUS_PROCESSING,
-              STATUS_REQUISITES_SENT, STATUS_PAID))
+        """, (
+            user_id, STATUS_PENDING, STATUS_PROCESSING,
+            STATUS_REQUISITES_SENT, STATUS_PAID
+        ))
         return rows[0] if rows else None
 
     async def get_all_pending_requests(self, limit: int = 20):
@@ -309,9 +361,8 @@ class Database:
         req = await self.get_request(request_id)
         if not req:
             return False
-        if cancelled_by == "user" and user_id is not None:
-            if req['user_id'] != user_id:
-                return False
+        if cancelled_by == "user" and user_id is not None and req['user_id'] != user_id:
+            return False
         status = STATUS_CANCELLED_BY_USER if cancelled_by == "user" else STATUS_CANCELLED_BY_ADMIN
         await self._run_execute(
             "UPDATE requests SET status=?, cancelled_at=?, cancelled_by=? WHERE id=?",
@@ -320,26 +371,38 @@ class Database:
         return True
 
     # --- Отзывы ---
+    async def recalculate_client_rating(self, user_id: int):
+        rows = await self._run_query(
+            "SELECT COALESCE(AVG(rating), 0) as avg_rating, COUNT(rating) as ratings_count "
+            "FROM feedback WHERE user_id=? AND rating IS NOT NULL",
+            (user_id,)
+        )
+        avg_rating = rows[0]['avg_rating'] if rows else 0
+        ratings_count = rows[0]['ratings_count'] if rows else 0
+        await self._run_execute(
+            "UPDATE clients SET avg_rating=?, ratings_count=? WHERE user_id=?",
+            (avg_rating, ratings_count, user_id)
+        )
+
     async def add_feedback(
         self, user_id: int, request_id: int,
         rating: Optional[int] = None, comment: Optional[str] = None
-    ):
+    ) -> bool:
+        exists = await self._run_query(
+            "SELECT id FROM feedback WHERE user_id=? AND request_id=? LIMIT 1",
+            (user_id, request_id)
+        )
+        if exists:
+            return False
+
         await self._run_insert(
             "INSERT INTO feedback (user_id, request_id, rating, comment, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (user_id, request_id, rating, comment, datetime.now().isoformat())
         )
         if rating is not None:
-            rows = await self._run_query(
-                "SELECT AVG(rating), COUNT(*) FROM feedback "
-                "WHERE user_id=? AND rating IS NOT NULL",
-                (user_id,)
-            )
-            if rows and rows[0][0] is not None:
-                await self._run_execute(
-                    "UPDATE clients SET avg_rating=?, ratings_count=? WHERE user_id=?",
-                    (rows[0][0], rows[0][1], user_id)
-                )
+            await self.recalculate_client_rating(user_id)
+        return True
 
     async def get_feedback_for_display(self, limit: int = 5, offset: int = 0):
         return await self._run_query("""
@@ -406,10 +469,14 @@ async def get_usdt_rate() -> float:
         return _cached_rate if _cached_rate is not None else 92.5
 
 def get_rank_and_discount(deals: int):
-    if deals < 3:  return ("Новичок", "🟢", 0.0, 3 - deals)
-    if deals < 7:  return ("Ходок",   "🔵", 0.5, 7 - deals)
-    if deals < 10: return ("Опытный", "🟠", 1.0, 10 - deals)
-    if deals < 15: return ("Мастер",  "🟣", 1.5, 15 - deals)
+    if deals < 3:
+        return ("Новичок", "🟢", 0.0, 3 - deals)
+    if deals < 7:
+        return ("Ходок", "🔵", 0.5, 7 - deals)
+    if deals < 10:
+        return ("Опытный", "🟠", 1.0, 10 - deals)
+    if deals < 15:
+        return ("Мастер", "🟣", 1.5, 15 - deals)
     return ("Легенда", "🔥", 2.0, 0)
 
 def calculate_client_total(amount: float, discount_percent: float = 0.0) -> float:
@@ -517,42 +584,58 @@ def reset_request_flow(context: ContextTypes.DEFAULT_TYPE):
                 'feedback_req_id', 'feedback_rating']:
         context.user_data.pop(key, None)
 
+async def show_settings_menu(update: Update):
+    await update.message.reply_text(
+        "⚙️ НАСТРОЙКИ\n\n"
+        "/edit_rules - изменить правила\n"
+        "/edit_schedule - изменить график\n"
+        "/edit_links - изменить ссылки\n"
+        "/afk on|off - режим ожидания",
+        reply_markup=get_admin_keyboard()
+    )
+
 # ==================================================
 # ================== ОСНОВНЫЕ HANDLERS =============
 # ==================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not user:
+    if not user or not update.message:
         return
+
     await db.add_client(user.id, user.username)
     banned, reason = await db.is_banned(user.id)
     if banned:
         await update.message.reply_text(f"⛔ ДОСТУП ЗАБЛОКИРОВАН\n\nПричина: {reason}")
         return
+
     reset_request_flow(context)
     await update.message.reply_text(
         f"👋 ПРИВЕТСТВУЮ, {user.first_name}!\n\n"
-        "SVEN OBMEN — быстрый и надежный обмен.\n\n"
-        "Используйте кнопки меню ниже ⬇️",
+        "SVEN OBMEN - быстрый и надежный обмен.\n\n"
+        "Используйте кнопки меню ниже",
         reply_markup=get_main_keyboard()
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     text = (
-        "📖 **СПРАВОЧНИК**\n\n"
-        "• **Новый запрос** — начать обмен\n"
-        "• **Профиль** — ваша статистика и ранг\n"
-        "• **Отзывы** — почитать, что пишут другие\n\n"
-        "**Команды:**\n"
-        "/start — перезапуск бота\n"
-        "/help — это сообщение\n"
-        "/stats — ваш профиль\n"
-        "/skip — пропустить ввод комментария к отзыву"
+        "📖 СПРАВОЧНИК\n\n"
+        "• Новый запрос - начать обмен\n"
+        "• Профиль - ваша статистика и ранг\n"
+        "• Отзывы - почитать, что пишут другие\n\n"
+        "Команды:\n"
+        "/start - перезапуск бота\n"
+        "/help - это сообщение\n"
+        "/stats - профиль или админ-статистика\n"
+        "/skip - пропустить ввод комментария к отзыву"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
     user_id = update.effective_user.id
     if context.user_data.get('step') == ASKING_FEEDBACK_COMMENT:
         req_id = context.user_data.pop('feedback_req_id', None)
@@ -565,27 +648,68 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активного запроса отзыва.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
+
+    if user_id == ADMIN_ID and not context.args:
+        top = await db.get_top_clients(limit=10)
+        if not top:
+            await update.message.reply_text("📊 Пока нет данных по завершенным сделкам.", reply_markup=get_admin_keyboard())
+            return
+
+        lines = ["📊 ТОП-10 КЛИЕНТОВ ПО СДЕЛКАМ\n"]
+        for i, c in enumerate(top, start=1):
+            uname = f"@{c['username']}" if c['username'] else f"ID:{c['user_id']}"
+            lines.append(
+                f"{i}. {uname} | Сделок: {c['total_deals']} | Объем: {c['total_volume']:.0f} ₽"
+            )
+        await update.message.reply_text("\n".join(lines), reply_markup=get_admin_keyboard())
+        return
+
+    if user_id == ADMIN_ID and context.args:
+        raw = context.args[0].strip()
+        target_id = None
+        if raw.startswith("@"):
+            target_id = await db.find_user_id_by_username(raw[1:])
+        else:
+            try:
+                target_id = int(raw)
+            except ValueError:
+                pass
+
+        if not target_id:
+            await update.message.reply_text("❌ Пользователь не найден. Используйте /stats <id|@username>")
+            return
+
+        await show_profile(update, context, target_id)
+        return
+
     await show_profile(update, context, user_id)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+
     user_id = update.effective_user.id
-    text = update.message.text
+    text = update.message.text or ""
 
     banned, reason = await db.is_banned(user_id)
     if banned:
         await update.message.reply_text(f"⛔ ДОСТУП ЗАБЛОКИРОВАН\nПричина: {reason}")
         return
 
-    # ========== КЛИЕНТСКИЕ КНОПКИ ==========
     if text == "🔥 НОВЫЙ ЗАПРОС":
         if await is_afk_mode() and user_id != ADMIN_ID:
             await update.message.reply_text("😴 Бот временно не принимает новые заявки.")
             return
+
         active = await db.get_user_active_request(user_id)
         if active:
-            await update.message.reply_text(f"⚠️ У вас есть активная заявка #{active['id']}.")
+            await update.message.reply_text(f"⚠️ У вас уже есть активная заявка #{active['id']}.")
             return
+
         reset_request_flow(context)
         await update.message.reply_text("💰 ВЫБЕРИТЕ ТИП ОПЕРАЦИИ:", reply_markup=get_operation_keyboard())
         return
@@ -604,21 +728,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_profile(update, context, user_id)
         return
 
-    # ========== АДМИНСКИЕ КНОПКИ (ТОЛЬКО ДЛЯ ADMIN_ID) ==========
     if user_id == ADMIN_ID:
         if text == "📋 ЗАЯВКИ":
             await show_requests_list(update, context)
             return
-        if text == "⚙️ НАСТРОЙКИ":
-            await update.message.reply_text(
-                "⚙️ **НАСТРОЙКИ**\n\n"
-                "/edit_rules — изменить правила\n"
-                "/edit_schedule — изменить график\n"
-                "/edit_links — изменить ссылки\n"
-                "/afk on/off — режим ожидания",
-                parse_mode="Markdown",
-                reply_markup=get_admin_keyboard()
-            )
+        if "НАСТРОЙКИ" in text:
+            await show_settings_menu(update)
             return
         if text == "📊 СТАТИСТИКА":
             await show_admin_stats(update, context)
@@ -630,32 +745,35 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔐 Выход из админ-панели.", reply_markup=get_main_keyboard())
             return
 
-    # Если ничего не подошло
     await update.message.reply_text("Пожалуйста, используйте кнопки меню.", reply_markup=get_main_keyboard())
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    if not update.message:
+        return
     stats = await db.get_client_stats(user_id)
-    user = update.effective_user
     if not stats or (stats['total_deals'] == 0 and stats['ratings_count'] == 0):
         await update.message.reply_text(
-            "👤 ПРОФИЛЬ\n\n📊 У вас пока нет завершённых сделок.",
+            "👤 ПРОФИЛЬ\n\n📊 У пользователя пока нет данных.",
             reply_markup=get_main_keyboard()
         )
         return
+
     deals = stats['total_deals']
     volume = stats['total_volume']
     rating = stats['avg_rating'] or 0
     rating_count = stats['ratings_count'] or 0
     rank_name, rank_emoji, discount, next_rank_deals = get_rank_and_discount(deals)
     progress_bar = get_progress_bar(deals, next_rank_deals)
+    username = f"@{stats['username']}" if stats['username'] else f"ID:{stats['user_id']}"
+
     text = (
-        f"👤 ПРОФИЛЬ\n\n"
+        f"👤 ПРОФИЛЬ {username}\n\n"
         f"🏆 РАНГ: {rank_emoji} {rank_name}\n"
         f"📊 ПРОГРЕСС: {progress_bar}\n"
-        f"💰 ВАША СКИДКА: {discount}%\n\n"
+        f"💰 СКИДКА: {discount}%\n\n"
         f"📈 СТАТИСТИКА:\n"
         f"• Сделок: {deals}\n"
-        f"• Объём: {volume:.0f} ₽\n"
+        f"• Объем: {volume:.0f} ₽\n"
         f"• Рейтинг: ⭐ {rating:.1f} ({rating_count} отзывов)"
     )
     await update.message.reply_text(text, reply_markup=get_main_keyboard())
@@ -670,7 +788,7 @@ async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reviews:
         if update.callback_query:
             await update.callback_query.answer("Больше отзывов нет.")
-        else:
+        elif update.message:
             await update.message.reply_text("⭐ ПОКА НЕТ ОТЗЫВОВ.\nБудьте первым!", reply_markup=get_main_keyboard())
         return
 
@@ -685,13 +803,13 @@ async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb_row = []
     if total > (page + 1) * limit:
-        kb_row.append(InlineKeyboardButton("📌 ПОКАЗАТЬ ЕЩЁ", callback_data="reviews_next"))
+        kb_row.append(InlineKeyboardButton("📌 ПОКАЗАТЬ ЕЩЕ", callback_data="reviews_next"))
     kb_row.append(InlineKeyboardButton("◀️ В МЕНЮ", callback_data="back_to_menu_ui"))
     reply_markup = InlineKeyboardMarkup([kb_row])
 
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-    else:
+    elif update.message:
         await update.message.reply_text(text, reply_markup=reply_markup)
 
 # ==================================================
@@ -700,68 +818,80 @@ async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     pending = await db.get_all_pending_requests(limit=15)
     processing = await db.get_all_processing_requests(limit=15)
-    
+
     if not pending and not processing:
         await update.message.reply_text("📋 НЕТ АКТИВНЫХ ЗАЯВОК.", reply_markup=get_admin_keyboard())
         return
-    
-    text = "📋 **АКТИВНЫЕ ЗАЯВКИ**\n\n"
-    
+
+    text = "📋 АКТИВНЫЕ ЗАЯВКИ\n\n"
+
     if pending:
-        text += "🟡 **В ОЖИДАНИИ:**\n"
+        text += "🟡 В ОЖИДАНИИ:\n"
         for req in pending:
             text += f"  #{req['id']} | {req['amount']:.0f} ₽ | ID:{req['user_id']}\n"
         text += "\n"
-    
+
     if processing:
-        text += "🟢 **В РАБОТЕ:**\n"
+        text += "🟢 В РАБОТЕ:\n"
         for req in processing:
             ico = "⏳" if req['status'] == STATUS_PROCESSING else "💳"
             text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {ico}\n"
-    
-    text += "\n🔧 **КОМАНДЫ:**\n"
-    text += "/take <id> — взять заявку\n"
-    text += "/send <id> <текст> — отправить реквизиты\n"
-    text += "/confirm <id> — подтвердить оплату\n"
-    text += "/reject <id> — отклонить\n"
-    text += "/getpdf <id> — скачать чек\n"
-    text += "/getlink <id> — посмотреть ссылку"
-    
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+
+    text += "\n🔧 КОМАНДЫ:\n"
+    text += "/take <id> - взять заявку\n"
+    text += "/send <id> <текст> - отправить реквизиты\n"
+    text += "/confirm <id> - подтвердить оплату\n"
+    text += "/reject <id> - отклонить\n"
+    text += "/getpdf <id> - скачать чек\n"
+    text += "/getlink <id> - посмотреть ссылку"
+
+    await update.message.reply_text(text, reply_markup=get_admin_keyboard())
 
 @admin_only
 async def show_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     clients = await db.get_all_clients()
     avg_rating = await db.get_avg_rating()
     total_deals = sum(c['total_deals'] for c in clients)
     total_volume = sum(c['total_volume'] for c in clients)
+
     text = (
-        f"📊 **ОБЩАЯ СТАТИСТИКА**\n\n"
+        f"📊 ОБЩАЯ СТАТИСТИКА\n\n"
         f"• Клиентов (активных): {len(clients)}\n"
         f"• Всего сделок: {total_deals}\n"
-        f"• Общий объём: {total_volume:.0f} ₽\n"
+        f"• Общий объем: {total_volume:.0f} ₽\n"
         f"• Ср. рейтинг: ⭐ {avg_rating:.1f}\n"
         f"• Расч. прибыль (~10%): {total_volume * 0.1:.0f} ₽"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    await update.message.reply_text(text, reply_markup=get_admin_keyboard())
 
 @admin_only
 async def show_banned_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
     banned = await db.get_banned_users()
     if not banned:
         await update.message.reply_text("🚫 НЕТ ЗАБАНЕННЫХ ПОЛЬЗОВАТЕЛЕЙ.", reply_markup=get_admin_keyboard())
         return
-    text = "🚫 **ЗАБАНЕННЫЕ ПОЛЬЗОВАТЕЛИ**\n\n"
+
+    text = "🚫 ЗАБАНЕННЫЕ ПОЛЬЗОВАТЕЛИ\n\n"
     for u in banned:
         text += f"👤 {format_user(u['username'], u['user_id'])} (ID: {u['user_id']})\n"
         text += f"📅 Забанен: {u['banned_at'][:10]}\n"
         text += f"📝 Причина: {u['ban_reason']}\n━━━━━━━━━━━━━\n"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+
+    await update.message.reply_text(text, reply_markup=get_admin_keyboard())
 
 # ==================================================
-# ================== CALLBACK =====================
+# ================== CALLBACK ======================
 # ==================================================
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -769,6 +899,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     await query.answer()
+
     data = query.data
     user_id = query.from_user.id
 
@@ -800,6 +931,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("type_"):
+        if await is_afk_mode() and user_id != ADMIN_ID:
+            await query.edit_message_text("😴 Бот временно не принимает новые заявки.")
+            return
+
+        active = await db.get_user_active_request(user_id)
+        if active:
+            await query.edit_message_text(
+                f"⚠️ У вас уже есть активная заявка #{active['id']}.",
+                reply_markup=get_cancel_keyboard(active['id'])
+            )
+            return
+
         op_key = data[5:]
         mapping = {
             "oxapay": OPERATION_OXAPAY,
@@ -820,37 +963,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = context.user_data.get('temp_amount')
         op_type = context.user_data.get('operation_type')
         invoice_link = context.user_data.get('invoice_link')
-        
+
         if not amount or not op_type:
             await query.edit_message_text("❌ Ошибка данных. Начните заново.", reply_markup=get_operation_keyboard())
             return
-        
+
         stats = await db.get_client_stats(user_id)
         deals = stats['total_deals'] if stats else 0
         _, _, discount, _ = get_rank_and_discount(deals)
         client_total = calculate_client_total(amount, discount)
-        req_id = await db.add_request(user_id, op_type, amount, client_total, invoice_link)
-        
+
+        req_id = await db.create_request_if_no_active(
+            user_id=user_id,
+            operation_type=op_type,
+            amount=amount,
+            client_total=client_total,
+            invoice_link=invoice_link
+        )
+
+        if req_id is None:
+            active = await db.get_user_active_request(user_id)
+            active_id = active['id'] if active else "?"
+            await query.edit_message_text(
+                f"⚠️ У вас уже есть активная заявка #{active_id}.",
+                reply_markup=get_cancel_keyboard(active['id']) if active else None
+            )
+            reset_request_flow(context)
+            return
+
         await query.edit_message_text(
-            f"✅ **ЗАЯВКА #{req_id} СОЗДАНА!**\n\n"
+            f"✅ ЗАЯВКА #{req_id} СОЗДАНА!\n\n"
             f"Тип: {op_type}\n"
             f"Сумма: {amount:.0f} ₽\n"
             f"К оплате: {client_total:.0f} ₽\n\n"
             f"Статус: ⏳ ОЖИДАЕТ ОБРАБОТКИ\n\n"
             f"Оператор скоро свяжется с вами.",
-            parse_mode="Markdown",
             reply_markup=get_cancel_keyboard(req_id)
         )
-        
-        admin_msg = f"🔔 **НОВАЯ ЗАЯВКА #{req_id}**\n"
-        admin_msg += f"👤 {format_user(query.from_user.username, user_id)}\n"
-        admin_msg += f"💰 Сумма: {amount:.0f} ₽\n"
-        admin_msg += f"💸 К оплате: {client_total:.0f} ₽\n"
+
+        admin_msg = (
+            f"🔔 НОВАЯ ЗАЯВКА #{req_id}\n"
+            f"👤 {format_user(query.from_user.username, user_id)}\n"
+            f"💰 Сумма: {amount:.0f} ₽\n"
+            f"💸 К оплате: {client_total:.0f} ₽\n"
+        )
         if invoice_link:
             admin_msg += f"🔗 Ссылка: {invoice_link}\n"
-        admin_msg += f"\n✅ /take {req_id} — взять в работу"
-        
-        await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
+        admin_msg += f"\n✅ /take {req_id} - взять в работу"
+
+        await context.bot.send_message(ADMIN_ID, admin_msg)
         reset_request_flow(context)
         return
 
@@ -878,8 +1039,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Вы поставили {rating}⭐\n\n"
                     "✏️ Оставьте комментарий или отправьте /skip для пропуска:"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logging.error(f"Rate callback parse error: {e}")
         return
 
 # ==================================================
@@ -889,55 +1050,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not update.message:
         return
+
     user_id = update.effective_user.id
     msg_text = update.message.text or ""
 
-    # Редактирование настроек админом
     if user_id == ADMIN_ID and context.user_data.get('editing_setting'):
         key = context.user_data.pop('editing_setting')
         await db.update_setting(key, msg_text)
         await update.message.reply_text(f"✅ Настройка '{key}' обновлена!", reply_markup=get_admin_keyboard())
         return
 
-    # PDF-чек
     if update.message.document:
         if update.message.document.mime_type == 'application/pdf':
             active = await db.get_user_active_request(user_id)
             if not active or active['status'] != STATUS_REQUISITES_SENT:
                 await update.message.reply_text("❌ У вас нет заявок в статусе ожидания оплаты.")
                 return
+
             await db.mark_paid(active['id'], update.message.document.file_id)
             await update.message.reply_text(
-                "✅ **ЧЕК ПРИНЯТ!**\n\n"
+                "✅ ЧЕК ПРИНЯТ!\n\n"
                 "Статус: 🔍 ПРОВЕРКА ОПЕРАТОРОМ\n"
-                "Обычно это занимает 5-15 минут.",
-                parse_mode="Markdown"
+                "Обычно это занимает 5-15 минут."
             )
             await context.bot.send_message(
                 ADMIN_ID,
-                f"💳 **ПОЛУЧЕН ЧЕК**\n"
+                f"💳 ПОЛУЧЕН ЧЕК\n"
                 f"👤 {format_user(update.effective_user.username, user_id)}\n"
                 f"📋 Заявка #{active['id']}\n"
-                f"✅ /confirm {active['id']} — подтвердить\n"
-                f"❌ /reject {active['id']} — отклонить",
-                parse_mode="Markdown"
+                f"✅ /confirm {active['id']} - подтвердить\n"
+                f"❌ /reject {active['id']} - отклонить"
             )
         else:
             await update.message.reply_text("❌ Пожалуйста, отправьте чек именно в формате PDF.")
         return
 
-    # Ожидание комментария к отзыву
     if context.user_data.get('step') == ASKING_FEEDBACK_COMMENT:
         req_id = context.user_data.pop('feedback_req_id', None)
         rating = context.user_data.pop('feedback_rating', None)
         context.user_data.pop('step', None)
+
         comment = msg_text if msg_text != '/skip' else None
         if req_id and rating is not None:
-            await db.add_feedback(user_id, req_id, rating, comment)
-        await update.message.reply_text("✅ Спасибо за отзыв!", reply_markup=get_main_keyboard())
+            saved = await db.add_feedback(user_id, req_id, rating, comment)
+            if saved:
+                await update.message.reply_text("✅ Спасибо за отзыв!", reply_markup=get_main_keyboard())
+            else:
+                await update.message.reply_text("ℹ️ Отзыв по этой заявке уже был сохранен.", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text("❌ Не удалось сохранить отзыв.", reply_markup=get_main_keyboard())
         return
 
-    # Ввод суммы
     if context.user_data.get('step') == ASKING_AMOUNT:
         amount = extract_amount(msg_text)
         if not amount or amount < 1000:
@@ -946,13 +1109,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_back_inline()
             )
             return
+
         context.user_data['temp_amount'] = amount
         op_type = context.user_data.get('operation_type')
-        
+
         if op_type == OPERATION_OXAPAY:
             context.user_data['step'] = ASKING_LINK
             await update.message.reply_text(
-                "🔗 ВВЕДИТЕ ССЫЛКУ НА СЧЁТ OXAPAY\n\n"
+                "🔗 ВВЕДИТЕ ССЫЛКУ НА СЧЕТ OXAPAY\n\n"
                 "Пример: https://pay.oxapay.com/invoice/xxxxxxxx",
                 reply_markup=get_back_inline()
             )
@@ -962,18 +1126,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, _, discount, _ = get_rank_and_discount(deals)
             client_total = calculate_client_total(amount, discount)
             await update.message.reply_text(
-                f"📝 **ПРОВЕРЬТЕ ДАННЫЕ**\n\n"
+                f"📝 ПРОВЕРЬТЕ ДАННЫЕ\n\n"
                 f"Тип: {op_type}\n"
                 f"Сумма: {amount:.0f} ₽\n"
                 f"💸 К ОПЛАТЕ: {client_total:.0f} ₽\n\n"
                 f"⚠️ После получения реквизитов вы обязуетесь произвести оплату.",
-                parse_mode="Markdown",
                 reply_markup=get_confirm_keyboard()
             )
             context.user_data.pop('step', None)
         return
 
-    # Ввод ссылки
     if context.user_data.get('step') == ASKING_LINK:
         link = msg_text.strip()
         if not (link.startswith("https://pay.oxapay.com/invoice/") or link.startswith("https://oxapay.com/invoice/")):
@@ -985,6 +1147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_back_inline()
             )
             return
+
         context.user_data['invoice_link'] = link
         amount = context.user_data.get('temp_amount')
         op_type = context.user_data.get('operation_type')
@@ -993,13 +1156,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, _, discount, _ = get_rank_and_discount(deals)
         client_total = calculate_client_total(amount, discount)
         await update.message.reply_text(
-            f"📝 **ПРОВЕРЬТЕ ДАННЫЕ**\n\n"
+            f"📝 ПРОВЕРЬТЕ ДАННЫЕ\n\n"
             f"Тип: {op_type}\n"
             f"Сумма: {amount:.0f} ₽\n"
             f"💸 К ОПЛАТЕ: {client_total:.0f} ₽\n"
             f"🔗 Ссылка: {link}\n\n"
-            f"⚠️ После подтверждения вы обязуетесь оплатить счёт.",
-            parse_mode="Markdown",
+            f"⚠️ После подтверждения вы обязуетесь оплатить счет.",
             reply_markup=get_confirm_keyboard()
         )
         context.user_data.pop('step', None)
@@ -1013,92 +1175,125 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def admin_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔐 **АДМИН-ПАНЕЛЬ**", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    if update.message:
+        await update.message.reply_text("🔐 АДМИН-ПАНЕЛЬ", reply_markup=get_admin_keyboard())
 
 @admin_only
 async def take_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /take <id>")
+        await update.message.reply_text("❌ Использование: /take <id>")
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     req = await db.get_request(req_id)
-    if not req or req['status'] != STATUS_PENDING:
-        return await update.message.reply_text("❌ Заявка не найдена или уже в работе.")
-    
+    if not req:
+        await update.message.reply_text("❌ Заявка не найдена.")
+        return
+    if req['status'] != STATUS_PENDING:
+        await update.message.reply_text(f"❌ Заявка в статусе {req['status']}, взять в работу нельзя.")
+        return
+
     await db.take_request(req_id)
-    
+
     await update.message.reply_text(
-        f"✅ **Заявка #{req_id} взята в работу!**\n\n"
-        f"📤 Отправьте реквизиты клиенту:\n"
-        f"`/send {req_id} <текст реквизитов>`\n\n"
-        f"📎 После оплаты клиент пришлёт чек.",
-        parse_mode="Markdown"
+        f"✅ Заявка #{req_id} взята в работу.\n\n"
+        f"📤 Отправьте реквизиты:\n"
+        f"/send {req_id} <текст реквизитов>"
     )
-    
+
     await safe_send(
         context, req['user_id'],
-        f"✅ **ЗАЯВКА #{req_id} ПРИНЯТА В РАБОТУ!**\n\n"
-        f"Оператор скоро пришлёт реквизиты для оплаты."
+        f"✅ ЗАЯВКА #{req_id} ПРИНЯТА В РАБОТУ!\n\n"
+        "Оператор скоро пришлет реквизиты для оплаты."
     )
 
 @admin_only
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if len(context.args) < 2:
-        return await update.message.reply_text(
-            "❌ Использование: `/send <id> <текст реквизитов>`\n\n"
-            "Пример: `/send 123 Карта 2200 1234 5678 9012`",
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            "❌ Использование: /send <id> <текст реквизитов>\n\n"
+            "Пример: /send 123 Карта 2200 1234 5678 9012"
         )
-    
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     requisites = " ".join(context.args[1:])
     req = await db.get_request(req_id)
-    
+
     if not req:
-        return await update.message.reply_text(f"❌ Заявка #{req_id} не найдена.")
-    
+        await update.message.reply_text(f"❌ Заявка #{req_id} не найдена.")
+        return
+
     if req['status'] not in (STATUS_PROCESSING, STATUS_PENDING):
-        return await update.message.reply_text(f"❌ Заявка #{req_id} в статусе {req['status']}, нельзя отправить реквизиты.")
-    
+        await update.message.reply_text(
+            f"❌ Заявка #{req_id} в статусе {req['status']}, отправка реквизитов недоступна."
+        )
+        return
+
     await db.send_requisites(req_id, requisites)
-    
-    await update.message.reply_text(f"✅ **Реквизиты для заявки #{req_id} отправлены!**", parse_mode="Markdown")
-    
-    msg = f"💳 **ВАШИ РЕКВИЗИТЫ ПО ЗАЯВКЕ #{req_id}**\n\n"
-    msg += f"💸 Сумма к оплате: {req['client_total']:.0f} ₽\n\n"
-    msg += f"📋 **РЕКВИЗИТЫ:**\n{requisites}\n\n"
-    msg += f"⚠️ После оплаты ОБЯЗАТЕЛЬНО пришлите PDF чек в этот чат."
-    if req.get('invoice_link'):
-        msg += f"\n\n🔗 Счёт: {req['invoice_link']}"
-    
-    await safe_send(context, req['user_id'], msg, parse_mode="Markdown", reply_markup=get_cancel_keyboard(req_id))
+    await update.message.reply_text(f"✅ Реквизиты для заявки #{req_id} отправлены!")
+
+    msg = (
+        f"💳 РЕКВИЗИТЫ ПО ЗАЯВКЕ #{req_id}\n\n"
+        f"💸 Сумма к оплате: {req['client_total']:.0f} ₽\n\n"
+        f"📋 Реквизиты:\n{requisites}\n\n"
+        f"⚠️ После оплаты ОБЯЗАТЕЛЬНО пришлите PDF-чек в этот чат.\n\n"
+        f"🚫 Для отмены заявки нажмите кнопку ниже."
+    )
+    if req['invoice_link']:
+        msg += f"\n\n🔗 Счет: {req['invoice_link']}"
+
+    sent = await safe_send(
+        context,
+        req['user_id'],
+        msg,
+        reply_markup=get_cancel_keyboard(req_id)
+    )
+    if not sent:
+        await safe_send(context, req['user_id'], msg)
 
 @admin_only
 async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /confirm <id>")
+        await update.message.reply_text("❌ Использование: /confirm <id>")
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     req = await db.get_request(req_id)
-    if not req or req['status'] != STATUS_PAID:
-        return await update.message.reply_text("❌ Заявка не в статусе PAID.")
-    
+    if not req:
+        await update.message.reply_text("❌ Заявка не найдена.")
+        return
+    if req['status'] != STATUS_PAID:
+        await update.message.reply_text(f"❌ Заявка в статусе {req['status']}. Нужен статус {STATUS_PAID}.")
+        return
+
     await db.complete_request(req_id, req['user_id'], req['amount'])
-    await update.message.reply_text(f"✅ **Заявка #{req_id} ЗАВЕРШЕНА!**", parse_mode="Markdown")
-    
+    await update.message.reply_text(f"✅ Заявка #{req_id} ЗАВЕРШЕНА!")
+
     await safe_send(
         context, req['user_id'],
-        f"🎉 **ЗАЯВКА #{req_id} УСПЕШНО ВЫПОЛНЕНА!**\n\n"
+        f"🎉 ЗАЯВКА #{req_id} УСПЕШНО ВЫПОЛНЕНА!\n\n"
         f"Сумма: {req['amount']:.0f} ₽\n\n"
         f"⭐ Оцените нашу работу:",
         reply_markup=get_rating_keyboard(req_id)
@@ -1106,97 +1301,138 @@ async def confirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /reject <id>")
+        await update.message.reply_text("❌ Использование: /reject <id>")
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     req = await db.get_request(req_id)
     if not req:
-        return await update.message.reply_text("❌ Заявка не найдена.")
-    
+        await update.message.reply_text("❌ Заявка не найдена.")
+        return
+
+    if req['status'] not in ACTIVE_REQUEST_STATUSES:
+        await update.message.reply_text(f"❌ Заявка в статусе {req['status']}, отклонение недоступно.")
+        return
+
     await db.cancel_request(req_id, "admin")
-    await update.message.reply_text(f"❌ **Заявка #{req_id} ОТКЛОНЕНА.**", parse_mode="Markdown")
-    
+    await update.message.reply_text(f"❌ Заявка #{req_id} ОТКЛОНЕНА.")
+
     await safe_send(
         context, req['user_id'],
-        f"❌ **ЗАЯВКА #{req_id} ОТКЛОНЕНА.**\n\n"
-        f"Причина: чек не прошёл проверку.\n\n"
+        f"❌ ЗАЯВКА #{req_id} ОТКЛОНЕНА.\n\n"
+        f"Причина: чек не прошел проверку.\n\n"
         f"Свяжитесь с поддержкой: @svenobmen"
     )
 
 @admin_only
 async def getpdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /getpdf <id>")
+        await update.message.reply_text("❌ Использование: /getpdf <id>")
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     req = await db.get_request(req_id)
     if not req or not req['pdf_file_id']:
-        return await update.message.reply_text("❌ PDF не найден.")
-    
+        await update.message.reply_text("❌ PDF не найден.")
+        return
+
     await context.bot.send_document(ADMIN_ID, req['pdf_file_id'], caption=f"📎 Чек к заявке #{req_id}")
 
 @admin_only
 async def getlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /getlink <id>")
+        await update.message.reply_text("❌ Использование: /getlink <id>")
+        return
+
     try:
         req_id = int(context.args[0])
     except ValueError:
-        return await update.message.reply_text("❌ ID должен быть числом.")
-    
+        await update.message.reply_text("❌ ID должен быть числом.")
+        return
+
     req = await db.get_request(req_id)
-    if not req or not req.get('invoice_link'):
-        return await update.message.reply_text("❌ Ссылка не найдена.")
-    
-    await update.message.reply_text(f"🔗 **Ссылка по заявке #{req_id}:**\n{req['invoice_link']}", parse_mode="Markdown")
+    if not req or not req['invoice_link']:
+        await update.message.reply_text("❌ Ссылка не найдена.")
+        return
+
+    await update.message.reply_text(f"🔗 Ссылка по заявке #{req_id}:\n{req['invoice_link']}")
 
 @admin_only
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if len(context.args) < 2:
-        return await update.message.reply_text("❌ Использование: /ban @username <причина>")
-    
+        await update.message.reply_text("❌ Использование: /ban @username <причина>")
+        return
+
     username = context.args[0].replace("@", "")
     reason = " ".join(context.args[1:])
     uid = await db.find_user_id_by_username(username)
-    
+
     if not uid:
-        return await update.message.reply_text("❌ Пользователь не найден.")
-    
+        await update.message.reply_text("❌ Пользователь не найден.")
+        return
+
     await db.ban_user(uid, reason)
-    await update.message.reply_text(f"🚫 **Пользователь @{username} заблокирован.**\nПричина: {reason}", parse_mode="Markdown")
-    await safe_send(context, uid, f"⛔ **ДОСТУП ЗАБЛОКИРОВАН**\n\nПричина: {reason}\n\nПо вопросам: @svenobmen")
+    await update.message.reply_text(f"🚫 Пользователь @{username} заблокирован.\nПричина: {reason}")
+    await safe_send(context, uid, f"⛔ ДОСТУП ЗАБЛОКИРОВАН\n\nПричина: {reason}\n\nПо вопросам: @svenobmen")
 
 @admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /unban @username")
-    
+        await update.message.reply_text("❌ Использование: /unban @username")
+        return
+
     username = context.args[0].replace("@", "")
     uid = await db.find_user_id_by_username(username)
-    
+
     if uid:
         await db.unban_user(uid)
-        await update.message.reply_text(f"✅ **Пользователь @{username} разблокирован.**", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Пользователь @{username} разблокирован.")
+    else:
+        await update.message.reply_text("❌ Пользователь не найден.")
 
 @admin_only
 async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     if not context.args:
-        return await update.message.reply_text("❌ Использование: /afk on/off")
-    
-    enabled = context.args[0].lower() == "on"
+        await update.message.reply_text("❌ Использование: /afk on/off")
+        return
+
+    arg = context.args[0].lower()
+    if arg not in ("on", "off"):
+        await update.message.reply_text("❌ Использование: /afk on/off")
+        return
+
+    enabled = arg == "on"
     await db.update_setting('afk_mode', '1' if enabled else '0')
     status = "ВКЛЮЧЕН (новые заявки не принимаются)" if enabled else "ВЫКЛЮЧЕН"
-    await update.message.reply_text(f"✅ **Режим AFK: {status}**", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Режим AFK: {status}")
 
 @admin_only
 async def edit_setting_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     cmd = update.message.text.split()[0].replace('/', '')
     setting_map = {'edit_rules': 'rules', 'edit_schedule': 'schedule', 'edit_links': 'links'}
     key = setting_map.get(cmd)
@@ -1204,9 +1440,8 @@ async def edit_setting_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['editing_setting'] = key
         current = await db.get_setting(key) or ""
         await update.message.reply_text(
-            f"📝 **ТЕКУЩЕЕ ЗНАЧЕНИЕ '{key}':**\n\n{current}\n\n"
-            f"✏️ Введите новое значение:",
-            parse_mode="Markdown"
+            f"📝 ТЕКУЩЕЕ ЗНАЧЕНИЕ '{key}':\n\n{current}\n\n"
+            f"✏️ Введите новое значение:"
         )
 
 @admin_only
@@ -1230,11 +1465,11 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if update and update.effective_message:
             await update.effective_message.reply_text("⚠️ Произошла внутренняя ошибка. Попробуйте позже.")
-    except:
+    except Exception:
         pass
 
 # ==================================================
-# ================== ЗАПУСК =======================
+# ================== ЗАПУСК ========================
 # ==================================================
 
 def main():
@@ -1269,7 +1504,12 @@ def main():
 
     # Обработчики
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
+            handle_message
+        )
+    )
 
     app.add_error_handler(error_handler)
 
