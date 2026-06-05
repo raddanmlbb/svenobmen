@@ -15,7 +15,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, MessageHandler, filters, CommandHandler,
-    CallbackQueryHandler, ContextTypes
+    CallbackQueryHandler, ContextTypes, JobQueue
 )
 from telegram.constants import ParseMode
 from telegram.error import Forbidden
@@ -1244,7 +1244,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await db.update_last_activity(user_id)
     
-    # Обработка любых документов
     if update.message.document:
         if update.message.document.mime_type == 'application/pdf':
             active = await db.get_user_active_request(user_id)
@@ -1581,8 +1580,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ================== MAIN ==========================
 def main() -> None:
-    from telegram.ext import JobQueue
-    
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1618,8 +1615,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
     # Напоминания
-
-application.job_queue.run_repeating(check_and_send_reminders, interval=60, first=10)
+    application.job_queue.run_repeating(check_and_send_reminders, interval=60, first=10)
 
     application.add_error_handler(error_handler)
 
