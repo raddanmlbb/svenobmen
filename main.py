@@ -1581,7 +1581,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ================== MAIN ==========================
 def main() -> None:
-    application = Application.builder().token(BOT_TOKEN).build()
+    from telegram.ext import JobQueue
+    
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .job_queue(JobQueue())
+        .build()
+    )
 
     # Команды
     application.add_handler(CommandHandler("start", start))
@@ -1611,8 +1618,8 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
     # Напоминания
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_and_send_reminders, interval=60, first=10)
+
+application.job_queue.run_repeating(check_and_send_reminders, interval=60, first=10)
 
     application.add_error_handler(error_handler)
 
