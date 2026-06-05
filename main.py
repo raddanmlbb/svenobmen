@@ -15,7 +15,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, MessageHandler, filters, CommandHandler,
-    CallbackQueryHandler, ContextTypes, JobQueue
+    CallbackQueryHandler, ContextTypes
 )
 from telegram.constants import ParseMode
 from telegram.error import Forbidden
@@ -1550,25 +1550,33 @@ async def afk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Используйте: /afk on или /afk off")
 
-async def check_and_send_reminders(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        due_reminders = await db.get_due_reminders()
-        for reminder in due_reminders:
-            request_id = reminder['request_id']
-            reminders_sent = reminder['reminders_sent']
-            user_id = reminder['user_id']
-            client_total = reminder['client_total']
-            if reminders_sent == 0:
-                message = f"⏰ <b>НАПОМИНАНИЕ ОБ ОПЛАТЕ</b>\n\n📋 Заявка #{request_id}\n💸 Сумма к оплате: {client_total:.0f} ₽\n\n⚠️ Пожалуйста, оплатите заявку и отправьте PDF-чек.\n⏳ У вас есть 15 минут до следующего предупреждения.\n\n📞 <b>Вопросы:</b> {SUPPORT_CONTACT}"
-            else:
-                message = f"🚨 <b>ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!</b>\n\n📋 Заявка #{request_id}\n💸 Сумма к оплате: {client_total:.0f} ₽\n\n⚠️ Если оплата не поступит в ближайшее время, заявка будет отменена.\n⛔ Неоплата влечёт БЛОКИРОВКУ АККАУНТА!\n\n📞 <b>Вопросы:</b> {SUPPORT_CONTACT}"
-            await safe_send(context, user_id, message, parse_mode="HTML")
-            await db.update_reminder_sent(request_id)
-            logging.info(f"Sent reminder {reminders_sent + 1}/2 for request #{request_id}")
-            if reminders_sent == 1:
-                await context.bot.send_message(ADMIN_ID, f"⚠️ Отправлено второе предупреждение по заявке #{request_id}\n👤 Пользователь: {user_id}\n💸 Сумма: {client_total:.0f} ₽")
-    except Exception as e:
-        logging.error(f"Error in check_and_send_reminders: {e}")
+# ================== НАПОМИНАНИЯ (asyncio) ====================
+async def reminder_loop(application: Application):
+    """Фоновый цикл проверки напоминаний (каждые 60 секунд)"""
+    await asyncio.sleep(10)  # первый запуск через 10 секунд после старта
+    while True:
+        try:
+            due_reminders = await db.get_due_reminders()
+            for reminder in due_reminders:
+                request_id = reminder['request_id']
+                reminders_sent = reminder['reminders_sent']
+                user_id = reminder['user_id']
+                client_total = reminder['client_total']
+                
+                if reminders_sent == 0:
+                    message = f"⏰ <b>НАПОМИНАНИЕ ОБ ОПЛАТЕ</b>\n\n📋 Заявка #{request_id}\n💸 Сумма к оплате: {client_total:.0f} ₽\n\n⚠️ Пожалуйста, оплатите заявку и отправьте PDF-чек.\n⏳ У вас есть 15 минут до следующего предупреждения.\n\n📞 <b>Вопросы:</b> {SUPPORT_CONTACT}"
+                else:
+                    message = f"🚨 <b>ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!</b>\n\n📋 Заявка #{request_id}\n💸 Сумма к оплате: {client_total:.0f} ₽\n\n⚠️ Если оплата не поступит в ближайшее время, заявка будет отменена.\n⛔ Неоплата влечёт БЛОКИРОВКУ АККАУНТА!\n\n📞 <b>Вопросы:</b> {SUPPORT_CONTACT}"
+                
+                await safe_send(application, user_id, message, parse_mode="HTML")
+                await db.update_reminder_sent(request_id)
+                logging.info(f"Sent reminder {reminders_sent + 1}/2 for request #{request_id}")
+                
+                if reminders_sent == 1:
+                    await application.bot.send_message(ADMIN_ID, f"⚠️ Отправлено второе предупреждение по заявке #{request_id}\n👤 Пользователь: {user_id}\n💸 Сумма: {client_total:.0f} ₽")
+        except Exception as e:
+            logging.error(f"Reminder loop error: {e}")
+        await asyncio.sleep(60)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logging.error(msg="Exception while handling an update:", exc_info=context.error)
@@ -1580,12 +1588,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # ================== MAIN ==========================
 def main() -> None:
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .job_queue(JobQueue())
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).build()
 
     # Команды
     application.add_handler(CommandHandler("start", start))
@@ -1614,8 +1617,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
 
-    # Напоминания
-    application.job_queue.run_repeating(check_and_send_reminders, interval=60, first=10)
+    # Запускаем напоминания через asyncio (не требует JobQueue)
+    loop = asyncio.get_event_loop()
+    loop.create_task(reminder_loop(application))
 
     application.add_error_handler(error_handler)
 
