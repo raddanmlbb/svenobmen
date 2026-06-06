@@ -4,7 +4,7 @@ import sqlite3
 import asyncio
 import html
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from typing import Tuple, Optional
 
@@ -28,6 +28,16 @@ SESSION_TIMEOUT_SECONDS = 300
 MAX_ACTIVE_REQUESTS = 2
 COOLDOWN_SECONDS = 300
 CHAT_ANTISPAM_SECONDS = 180
+
+# Константы комиссий
+SERVICE_COMMISSION_RATE = 0.10  # 10%
+MIN_SERVICE_COMMISSION = 180  # минимальная комиссия сервиса
+MEXC_TRC20_FEE = 1.0  # USDT
+MEXC_BTC_FEE = 0.0002  # BTC
+
+# Константы для сообщений
+NONPAYMENT_WARNING = "⚠️ Оплатите ТОЧНО указанную сумму.\n⛔ Неоплата = БАН."
+SUPPORT_MSG = f"📞 Поддержка: {SUPPORT_CONTACT}"
 
 STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
@@ -125,42 +135,29 @@ def idempotent_callback(timeout: int = 5):
     return decorator
 
 # ================== КОМИССИИ ====================
-def _get_btc_network_fee(amount_usd: float, btc_rate: float) -> float:
-    if amount_usd <= 61: btc_fee = 0.00032
-    elif amount_usd <= 183: btc_fee = 0.00063
-    elif amount_usd <= 1218: btc_fee = 0.00079
-    else: btc_fee = 0.0012
-    return btc_fee * btc_rate
-
-def _get_trc20_fee(amount_usd: float, usdt_rate: float) -> float:
-    if amount_usd <= 100: return 5 * usdt_rate
-    elif amount_usd <= 999: return 7 * usdt_rate
-    else: return 11 * usdt_rate
-
-def _get_ton_fee(amount_usd: float, usdt_rate: float) -> float:
-    if amount_usd <= 100: return 2 * usdt_rate
-    elif amount_usd <= 999: return 4 * usdt_rate
-    elif amount_usd <= 4997: return 8 * usdt_rate
-    else: return 15 * usdt_rate
-
 def get_network_fee(deal_amount_rub: float, coin: str, operation_type: str,
                     usdt_rate: float, btc_rate: float) -> float:
+    """Комиссия сети/биржи за вывод"""
+    # Bitpapa чек — без комиссий (внутренний перевод)
     if "Bitpapa" in operation_type:
         return 0
-    amount_usd = deal_amount_rub / usdt_rate
+    
+    # Все остальные операции — через MEXC
     if coin == "BTC":
-        return _get_btc_network_fee(amount_usd, btc_rate)
+        return MEXC_BTC_FEE * btc_rate  # 0.0002 BTC
     elif coin == "USDT":
-        if "OxaPay" in operation_type:
-            return _get_ton_fee(amount_usd, usdt_rate)
-        else:
-            return _get_trc20_fee(amount_usd, usdt_rate)
+        return MEXC_TRC20_FEE * usdt_rate  # 1 USDT
+    
     return 0
 
 def calculate_client_total(amount: float, discount_percent: float = 0.0,
                            use_free_deal: bool = False, coin: str = "USDT",
                            operation_type: str = "", usdt_rate: float = 92.5,
                            btc_rate: float = 5500000) -> Tuple[float, float, float]:
+    """
+    amount — сумма, которую клиент хочет получить в крипте.
+    Возвращает (client_total, crypto_amount, service_commission).
+    """
     rate = usdt_rate if coin == "USDT" else btc_rate
     network_fee = get_network_fee(amount, coin, operation_type, usdt_rate, btc_rate)
     
@@ -170,9 +167,8 @@ def calculate_client_total(amount: float, discount_percent: float = 0.0,
         crypto_amount = amount / rate
         return client_total, crypto_amount, service_commission
     
-    base_commission_rate = 0.169
-    actual_rate = max(0, base_commission_rate - (discount_percent / 100))
-    service_commission = max(285, amount * actual_rate)
+    actual_rate = max(0, SERVICE_COMMISSION_RATE - (discount_percent / 100))
+    service_commission = max(MIN_SERVICE_COMMISSION, amount * actual_rate)
     client_total = amount + network_fee + service_commission
     crypto_amount = amount / rate
     return client_total, crypto_amount, service_commission
@@ -180,12 +176,13 @@ def calculate_client_total(amount: float, discount_percent: float = 0.0,
 def calculate_operator_info(client_total: float, service_commission: float,
                              coin: str, operation_type: str,
                              usdt_rate: float, btc_rate: float) -> Tuple[float, float, float]:
+    """Возвращает (operator_crypto_amount, network_fee_crypto, operator_profit_crypto)"""
     rate = usdt_rate if coin == "USDT" else btc_rate
     operator_crypto_amount = client_total / rate
     operator_profit_crypto = service_commission / rate
-    network_fee_rub = get_network_fee(client_total - service_commission - get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate), coin, operation_type, usdt_rate, btc_rate)
-    network_fee_rub = get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate) if abs(client_total - service_commission - get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate)) < 1 else 0
-    network_fee_rub = get_network_fee(client_total, coin, operation_type, usdt_rate, btc_rate)
+    # Сетевая комиссия от базовой суммы сделки
+    base_amount = client_total - service_commission
+    network_fee_rub = get_network_fee(base_amount, coin, operation_type, usdt_rate, btc_rate)
     network_fee_crypto = network_fee_rub / rate
     return operator_crypto_amount, network_fee_crypto, operator_profit_crypto
 
@@ -199,7 +196,8 @@ class Database:
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_file, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -265,18 +263,31 @@ class Database:
                 user_id INTEGER, request_id INTEGER,
                 message_text TEXT, direction TEXT, created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS processed_callbacks (
+                callback_id TEXT PRIMARY KEY,
+                created_at TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_requests_user_id ON requests(user_id);
             CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
             CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback(user_id);
             CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
             CREATE INDEX IF NOT EXISTS idx_request_events_request_id ON request_events(request_id);
             CREATE INDEX IF NOT EXISTS idx_chat_messages_user_time ON chat_messages(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_reminders_next_at ON payment_reminders(next_reminder_at) WHERE reminders_sent < 2;
         """)
         conn.commit()
 
     def _migrate_db(self, conn):
+        for attempt in range(5):
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) and attempt < 4:
+                    import time; time.sleep(0.5 * (attempt + 1))
+                else:
+                    raise
         try:
-            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute("PRAGMA table_info(requests)")
             existing_columns = {column[1] for column in cursor.fetchall()}
             new_cols = {
@@ -336,6 +347,19 @@ class Database:
         except Exception as e:
             logging.error(f"❌ Ошибка логирования: {e}", exc_info=True)
 
+    async def _is_callback_processed(self, callback_id: str) -> bool:
+        rows = await self._run_query(
+            "SELECT 1 FROM processed_callbacks WHERE callback_id=? AND created_at > ?",
+            (callback_id, (datetime.now() - timedelta(seconds=30)).isoformat())
+        )
+        return bool(rows)
+
+    async def _mark_callback_processed(self, callback_id: str):
+        await self._run_execute(
+            "INSERT OR IGNORE INTO processed_callbacks (callback_id, created_at) VALUES (?, ?)",
+            (callback_id, datetime.now().isoformat())
+        )
+
     async def _run_query(self, query: str, params: tuple = ()):
         async with self._lock:
             with self._get_connection() as conn:
@@ -372,6 +396,14 @@ class Database:
             cur.execute(query, params)
             return cur.fetchall()
 
+    def safe_get(self, row, key, default=0):
+        """Безопасное получение значения из sqlite3.Row"""
+        try:
+            val = row[key]
+            return val if val is not None else default
+        except (IndexError, KeyError):
+            return default
+
     async def update_last_activity(self, user_id: int):
         await self._run_execute("INSERT OR REPLACE INTO user_activity (user_id, last_active) VALUES (?, ?)", (user_id, datetime.now().isoformat()))
 
@@ -397,6 +429,14 @@ class Database:
         rows = await self._run_query("SELECT user_id, username FROM clients WHERE referral_code=?", (code,))
         return rows[0] if rows else None
 
+    async def get_first_deal_discount(self, user_id: int) -> float:
+        rows = await self._run_query(
+            "SELECT referred_by, total_deals FROM clients WHERE user_id=?", (user_id,)
+        )
+        if rows and rows[0]['referred_by'] and (rows[0]['total_deals'] or 0) == 0:
+            return 3.0
+        return 0.0
+
     async def add_referral(self, referrer_id: int, referred_id: int) -> bool:
         try:
             await self._run_insert("INSERT INTO referrals (referrer_id, referred_id, created_at, status) VALUES (?, ?, ?, ?)", (referrer_id, referred_id, datetime.now().isoformat(), "pending"))
@@ -406,13 +446,14 @@ class Database:
             return False
 
     async def complete_referral(self, referred_id: int) -> Optional[int]:
-        async with self._lock:
-            rows = await self._run_query_without_lock("SELECT id, referrer_id, status FROM referrals WHERE referred_id=?", (referred_id,))
-            if not rows or rows[0]['status'] != 'pending':
-                return None
-            referrer_id = rows[0]['referrer_id']
-            await self._run_execute_without_lock("UPDATE referrals SET status='completed', first_completed_at=? WHERE id=?", (datetime.now().isoformat(), rows[0]['id']))
-            return referrer_id
+        result = await self._run_execute(
+            "UPDATE referrals SET status='completed', first_completed_at=? WHERE referred_id=? AND status='pending'",
+            (datetime.now().isoformat(), referred_id)
+        )
+        if result == 0:
+            return None
+        rows = await self._run_query("SELECT referrer_id FROM referrals WHERE referred_id=?", (referred_id,))
+        return rows[0]['referrer_id'] if rows else None
 
     async def increment_referral_completed(self, referrer_id: int) -> int:
         await self._run_execute("UPDATE clients SET referral_completed_count = referral_completed_count + 1 WHERE user_id=?", (referrer_id,))
@@ -443,6 +484,7 @@ class Database:
         return await self._run_query("SELECT user_id, username, ban_reason, banned_at FROM clients WHERE is_banned=1")
 
     async def update_client_after_deal(self, user_id: int, amount: float):
+        await self._run_execute("INSERT OR IGNORE INTO clients (user_id, created_at) VALUES (?, ?)", (user_id, datetime.now().isoformat()))
         await self._run_execute("UPDATE clients SET total_deals=total_deals+1, total_volume=total_volume+? WHERE user_id=?", (amount, user_id))
 
     async def get_client_stats(self, user_id: int):
@@ -460,7 +502,10 @@ class Database:
         async with self._lock:
             with self._get_connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                cur = conn.execute("SELECT created_at FROM chat_messages WHERE user_id=? AND direction='to_admin' ORDER BY created_at DESC LIMIT 1", (user_id,))
+                cur = conn.execute(
+                    "SELECT created_at FROM chat_messages WHERE user_id=? AND request_id=? AND direction='to_admin' ORDER BY created_at DESC LIMIT 1",
+                    (user_id, request_id)
+                )
                 row = cur.fetchone()
                 if row and row['created_at']:
                     last_time = datetime.fromisoformat(row['created_at']).timestamp()
@@ -480,56 +525,78 @@ class Database:
                                      use_free_deal: bool = False,
                                      invoice_link: str = None) -> Tuple[Optional[int], str]:
         async with self._lock:
-            with self._get_connection() as conn:
+            for attempt in range(3):
                 try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    cur = conn.execute("SELECT COUNT(*) as cnt FROM requests WHERE user_id=? AND status IN (?,?,?,?)", 
-                                       (user_id, STATUS_PENDING, STATUS_PROCESSING, STATUS_REQUISITES_SENT, STATUS_PAID))
-                    if cur.fetchone()['cnt'] >= MAX_ACTIVE_REQUESTS:
-                        conn.rollback()
-                        return None, f"⚠️ Максимум {MAX_ACTIVE_REQUESTS} активных заявок."
-                    cur = conn.execute("SELECT MAX(COALESCE(completed_at, cancelled_at)) as last_action FROM requests WHERE user_id=? AND (status = ? OR status IN (?, ?))", 
-                                       (user_id, STATUS_COMPLETED, STATUS_CANCELLED_BY_USER, STATUS_CANCELLED_BY_ADMIN))
-                    row = cur.fetchone()
-                    if row and row['last_action']:
-                        last_action_time = datetime.fromisoformat(row['last_action']).timestamp()
-                        time_diff = datetime.now().timestamp() - last_action_time
-                        if time_diff < COOLDOWN_SECONDS:
+                    with self._get_connection() as conn:
+                        conn.execute("BEGIN IMMEDIATE")
+                        
+                        cur = conn.execute("SELECT COUNT(*) as cnt FROM requests WHERE user_id=? AND status IN (?,?,?,?)", 
+                                           (user_id, STATUS_PENDING, STATUS_PROCESSING, STATUS_REQUISITES_SENT, STATUS_PAID))
+                        if cur.fetchone()['cnt'] >= MAX_ACTIVE_REQUESTS:
                             conn.rollback()
-                            remaining = int(COOLDOWN_SECONDS - time_diff)
-                            return None, f"⏳ Подождите {remaining // 60} мин {remaining % 60} сек"
-                    if use_free_deal:
-                        cur = conn.execute("SELECT id FROM free_deals WHERE user_id=? AND used_at IS NULL LIMIT 1", (user_id,))
-                        free_deal_row = cur.fetchone()
-                        if not free_deal_row:
-                            conn.rollback()
-                            return None, "❌ Бесплатная сделка недоступна."
-                        cur = conn.execute("UPDATE free_deals SET used_at=? WHERE id=? AND used_at IS NULL", 
-                                          (datetime.now().isoformat(), free_deal_row['id']))
-                        if cur.rowcount != 1:
-                            conn.rollback()
-                            return None, "❌ Не удалось списать бесплатную сделку."
-                        conn.execute("UPDATE clients SET free_deals_count = MAX(0, free_deals_count - 1) WHERE user_id=?", (user_id,))
-                    cur = conn.execute("""
-                        INSERT INTO requests (user_id, operation_type, amount, client_total, 
-                            crypto_amount, operator_crypto_amount, network_fee_crypto,
-                            service_commission, operator_profit_crypto,
-                            status, created_at, invoice_link)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (user_id, operation_type, amount, client_total, crypto_amount,
-                          operator_crypto_amount, network_fee_crypto, service_commission,
-                          operator_profit_crypto,
-                          STATUS_PENDING, datetime.now().isoformat(), invoice_link))
-                    request_id = cur.lastrowid
-                    conn.execute("INSERT INTO request_events (request_id, old_status, new_status, changed_by, changed_at, comment) VALUES (?, NULL, ?, 'system', ?, 'Заявка создана')", 
-                                (request_id, STATUS_PENDING, datetime.now().isoformat()))
-                    conn.commit()
-                    logging.info(f"✅ Заявка #{request_id} создана пользователем {user_id}")
-                    return request_id, None
+                            return None, f"⚠️ Максимум {MAX_ACTIVE_REQUESTS} активных заявок."
+                        
+                        cur = conn.execute("""
+                            SELECT MAX(
+                                CASE 
+                                    WHEN completed_at IS NOT NULL THEN completed_at
+                                    WHEN cancelled_at IS NOT NULL THEN cancelled_at
+                                    ELSE created_at
+                                END
+                            ) as last_action
+                            FROM requests 
+                            WHERE user_id=? AND status IN (?, ?, ?)
+                        """, (user_id, STATUS_COMPLETED, STATUS_CANCELLED_BY_USER, STATUS_CANCELLED_BY_ADMIN))
+                        row = cur.fetchone()
+                        if row and row['last_action']:
+                            last_action_time = datetime.fromisoformat(row['last_action']).timestamp()
+                            time_diff = datetime.now().timestamp() - last_action_time
+                            if time_diff < COOLDOWN_SECONDS:
+                                conn.rollback()
+                                remaining = int(COOLDOWN_SECONDS - time_diff)
+                                return None, f"⏳ Подождите {remaining // 60} мин {remaining % 60} сек"
+                        
+                        if use_free_deal:
+                            cur = conn.execute("SELECT id FROM free_deals WHERE user_id=? AND used_at IS NULL LIMIT 1", (user_id,))
+                            free_deal_row = cur.fetchone()
+                            if not free_deal_row:
+                                conn.rollback()
+                                return None, "❌ Бесплатная сделка недоступна."
+                            cur = conn.execute("UPDATE free_deals SET used_at=? WHERE id=? AND used_at IS NULL", 
+                                              (datetime.now().isoformat(), free_deal_row['id']))
+                            if cur.rowcount != 1:
+                                conn.rollback()
+                                return None, "❌ Не удалось списать бесплатную сделку."
+                            conn.execute("UPDATE clients SET free_deals_count = MAX(0, free_deals_count - 1) WHERE user_id=?", (user_id,))
+                        
+                        cur = conn.execute("""
+                            INSERT INTO requests (user_id, operation_type, amount, client_total, 
+                                crypto_amount, operator_crypto_amount, network_fee_crypto,
+                                service_commission, operator_profit_crypto,
+                                status, created_at, invoice_link)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (user_id, operation_type, amount, client_total, crypto_amount,
+                              operator_crypto_amount, network_fee_crypto, service_commission,
+                              operator_profit_crypto,
+                              STATUS_PENDING, datetime.now().isoformat(), invoice_link))
+                        request_id = cur.lastrowid
+                        
+                        conn.execute("INSERT INTO request_events (request_id, old_status, new_status, changed_by, changed_at, comment) VALUES (?, NULL, ?, 'system', ?, 'Заявка создана')", 
+                                    (request_id, STATUS_PENDING, datetime.now().isoformat()))
+                        
+                        conn.commit()
+                        logging.info(f"✅ Заявка #{request_id} создана пользователем {user_id}")
+                        return request_id, None
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < 2:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                    else:
+                        logging.error(f"❌ Ошибка создания заявки: {e}", exc_info=True)
+                        return None, f"❌ Внутренняя ошибка. Попробуйте позже.\n{e}"
                 except Exception as e:
-                    conn.rollback()
                     logging.error(f"❌ Ошибка создания заявки: {e}", exc_info=True)
                     return None, f"❌ Внутренняя ошибка. Попробуйте позже.\n{e}"
+            return None, "❌ База данных занята. Попробуйте через несколько секунд."
 
     async def get_request(self, request_id: int):
         rows = await self._run_query("SELECT * FROM requests WHERE id=?", (request_id,))
@@ -569,7 +636,9 @@ class Database:
         now = datetime.now().isoformat()
         await self._run_execute("UPDATE requests SET status=?, completed_at=? WHERE id=? AND status=?", (STATUS_COMPLETED, now, request_id, STATUS_PAID))
         await self._log_event(request_id, STATUS_PAID, STATUS_COMPLETED, 'admin')
-        await self.update_client_after_deal(user_id, amount)
+        req = await self.get_request(request_id)
+        deal_amount = req['amount'] if req else amount
+        await self.update_client_after_deal(user_id, deal_amount)
         await self.delete_reminder_record(request_id)
         referrer_id = await self.complete_referral(user_id)
         if referrer_id:
@@ -602,7 +671,15 @@ class Database:
 
     async def get_due_reminders(self) -> list:
         now = datetime.now().isoformat()
-        return await self._run_query("SELECT pr.request_id, pr.reminders_sent, r.user_id, r.amount, r.client_total FROM payment_reminders pr JOIN requests r ON pr.request_id = r.id WHERE r.status = ? AND pr.reminders_sent < 2 AND pr.next_reminder_at <= ?", (STATUS_REQUISITES_SENT, now))
+        return await self._run_query(
+            """SELECT pr.request_id, pr.reminders_sent, r.user_id, r.amount, r.client_total 
+               FROM payment_reminders pr 
+               JOIN requests r ON pr.request_id = r.id 
+               LEFT JOIN clients c ON r.user_id = c.user_id
+               WHERE r.status = ? AND pr.reminders_sent < 2 AND pr.next_reminder_at <= ?
+               AND (c.is_banned IS NULL OR c.is_banned = 0)""",
+            (STATUS_REQUISITES_SENT, now)
+        )
 
     async def update_reminder_sent(self, request_id: int):
         now = datetime.now()
@@ -617,17 +694,24 @@ class Database:
         if rating is not None:
             rows = await self._run_query("SELECT AVG(rating) as avg_r, COUNT(*) as cnt FROM feedback WHERE user_id=? AND rating IS NOT NULL", (user_id,))
             if rows and rows[0]['avg_r'] is not None:
-                await self._run_execute("UPDATE clients SET avg_rating=?, ratings_count=? WHERE user_id=?", (rows[0]['avg_r'], rows[0]['cnt'], user_id))
+                await self._run_execute("UPDATE clients SET avg_rating=?, ratings_count=? WHERE user_id=?", (round(rows[0]['avg_r'], 1), rows[0]['cnt'], user_id))
 
     async def get_feedback_for_display(self, limit: int = 5, offset: int = 0):
-        return await self._run_query("SELECT f.id, f.user_id, c.username, f.rating, f.comment, f.created_at FROM feedback f JOIN clients c ON f.user_id = c.user_id WHERE f.is_displayed=1 AND (f.comment IS NOT NULL OR f.rating IS NOT NULL) ORDER BY f.created_at DESC LIMIT ? OFFSET ?", (limit, offset))
+        return await self._run_query(
+            """SELECT f.id, f.user_id, COALESCE(c.username, 'User') as username, f.rating, f.comment, f.created_at 
+               FROM feedback f 
+               LEFT JOIN clients c ON f.user_id = c.user_id 
+               WHERE f.comment IS NOT NULL OR f.rating IS NOT NULL 
+               ORDER BY f.created_at DESC LIMIT ? OFFSET ?""",
+            (limit, offset)
+        )
 
     async def get_feedback_count(self) -> int:
-        rows = await self._run_query("SELECT COUNT(*) as cnt FROM feedback WHERE is_displayed=1")
+        rows = await self._run_query("SELECT COUNT(*) as cnt FROM feedback WHERE comment IS NOT NULL OR rating IS NOT NULL")
         return rows[0]['cnt'] if rows else 0
 
     async def get_avg_rating(self) -> float:
-        rows = await self._run_query("SELECT AVG(rating) as avg FROM feedback WHERE rating IS NOT NULL AND is_displayed=1")
+        rows = await self._run_query("SELECT AVG(rating) as avg FROM feedback WHERE rating IS NOT NULL")
         return rows[0]['avg'] if rows and rows[0]['avg'] is not None else 0.0
 
     async def get_setting(self, key: str) -> Optional[str]:
@@ -669,8 +753,9 @@ def get_status_progress_bar(status: str) -> tuple:
         return f"[{'🟩' * percent}{'⬜' * (10 - percent)}] {text}", percent * 10
     return "[⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜] ❓ Статус неизвестен", 0
 
-def format_user(username: Optional[str], user_id: int) -> str:
-    return f"@{username}" if username else f"ID:{user_id}"
+def format_user(username: Optional[str], user_id: int, escape_html: bool = False) -> str:
+    result = f"@{username}" if username else f"ID:{user_id}"
+    return html.escape(result) if escape_html else result
 
 def extract_amount(text: str) -> Optional[float]:
     if not text: return None
@@ -707,12 +792,21 @@ async def safe_send(context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str,
     except Exception as e: logging.error(f"Error sending message to {user_id}: {e}", exc_info=True)
     return None
 
+async def safe_send_bot(bot, user_id: int, text: str, **kwargs):
+    try: return await bot.send_message(chat_id=user_id, text=text, **kwargs)
+    except Forbidden: logging.warning(f"User {user_id} blocked the bot.")
+    except Exception as e: logging.error(f"Error: {e}", exc_info=True)
+
 def reset_request_flow(context: ContextTypes.DEFAULT_TYPE):
-    for key in ['step', 'temp_amount', 'operation_type', 'base_operation', 'selected_coin',
-                'invoice_link', 'feedback_req_id', 'feedback_rating', 'pending_free_deal',
-                'temp_client_total_with_commission', 'temp_client_total_without_commission',
-                'temp_op_type', 'temp_coin_data', 'temp_invoice_link',
-                'chat_request_id', 'admin_send_req_id', 'admin_msg_req_id']:
+    keys_to_clear = [
+        'step', 'temp_amount', 'operation_type', 'base_operation', 'selected_coin',
+        'invoice_link', 'feedback_req_id', 'feedback_rating', 'pending_free_deal',
+        'temp_client_total_with_commission', 'temp_client_total_without_commission',
+        'temp_op_type', 'temp_coin_data', 'temp_invoice_link',
+        'chat_request_id', 'admin_send_req_id', 'admin_msg_req_id',
+        'editing_setting', 'reviews_page'
+    ]
+    for key in keys_to_clear:
         context.user_data.pop(key, None)
 
 async def get_context_keyboard(user_id: int):
@@ -825,13 +919,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == ADMIN_ID:
         await update.message.reply_text(f"🔐 ДОБРО ПОЖАЛОВАТЬ, АДМИНИСТРАТОР!\n\n💱 Курсы:\n• USDT: {usdt_rate} ₽\n• BTC: {btc_rate} ₽\n\n/admin — панель управления.", reply_markup=get_admin_keyboard())
     else:
-        await update.message.reply_text(f"🔥 <b>ДОБРО ПОЖАЛОВАТЬ, {safe_name}!</b> 🔥\n\nSVEN OBMEN — быстрый обмен криптовалюты\n\n📊 Курс USDT: {usdt_rate} ₽\n🏆 Ранг: {rank_emoji} {rank_name}\n💰 Скидка: {discount}%\n🎁 Бесплатных сделок: {free_deals}\n\n▶️ Нажмите «🔥 НОВЫЙ ЗАПРОС»", parse_mode="HTML", reply_markup=get_main_keyboard())
+        await update.message.reply_text(f"🔥 <b>ДОБРО ПОЖАЛОВАТЬ, {safe_name}!</b> 🔥\n\nSVEN OBMEN — быстрый обмен криптовалюты\n\n📊 Курс USDT: {usdt_rate} ₽\n🏆 Ранг: {rank_emoji} {rank_name}\n💰 Скидка: {discount}%\n🎁 Бесплатных сделок: {free_deals}\n\n▶️ Нажмите «🔥 НОВЫЙ ЗАПРОС»", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 @not_banned
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.update_last_activity(update.effective_user.id)
     links = await db.get_setting('links') or ""
-    await update.message.reply_text(f"📖 <b>СПРАВОЧНИК</b>\n\n<b>Команды:</b>\n/start /help /stats /status /cancel /referral\n\n<b>Обмен:</b>\n1️⃣ «🔥 НОВЫЙ ЗАПРОС»\n2️⃣ Выберите тип\n3️⃣ Выберите крипту\n4️⃣ Введите сумму\n5️⃣ Подтвердите\n\n{links}\n\n📞 Поддержка: {SUPPORT_CONTACT}", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(f"📖 <b>СПРАВОЧНИК</b>\n\n<b>Команды:</b>\n/start /help /stats /status /cancel /referral\n\n<b>Обмен:</b>\n1️⃣ «🔥 НОВЫЙ ЗАПРОС»\n2️⃣ Выберите тип\n3️⃣ Выберите крипту\n4️⃣ Введите сумму\n5️⃣ Подтвердите\n\n{links}\n\n📞 Поддержка: {SUPPORT_CONTACT}", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 @not_banned
 async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -849,7 +943,7 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     referrals_count = stats['referral_completed_count'] or 0
     free_deals = stats['free_deals_count'] or 0
     needed = (3 - (referrals_count % 3)) % 3
-    await update.message.reply_text(f"🔗 <b>РЕФЕРАЛЬНАЯ ССЫЛКА</b>\n\n<code>{ref_link}</code>\n\n📊 Приглашено: {referrals_count}\n🎁 Бесплатных сделок: {free_deals}\n📌 До следующей: {needed} чел.", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await update.message.reply_text(f"🔗 <b>РЕФЕРАЛЬНАЯ ССЫЛКА</b>\n\n<code>{ref_link}</code>\n\n📊 Приглашено: {referrals_count}\n🎁 Бесплатных сделок: {free_deals}\n📌 До следующей: {needed} чел.", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
 
 @not_banned
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -876,14 +970,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_id = active['id']
     amount = active['amount']
     client_total = active['client_total']
-    crypto_amount = active['crypto_amount'] if active['crypto_amount'] else 0
+    crypto_amount = db.safe_get(active, 'crypto_amount')
     status = active['status']
     operation_type = active['operation_type']
     progress_bar, _ = get_status_progress_bar(status)
-    if "Биткоин" in operation_type or "BTC" in operation_type:
-        coin_code = "BTC"
-    else:
-        coin_code = "USDT"
+    coin_code = "BTC" if "BTC" in operation_type else "USDT"
     text = (f"📋 <b>ЗАЯВКА #{req_id}</b>\n\n{progress_bar}\n\n"
             f"📊 {format_status(status)}\n\n"
             f"💰 <b>СУММА СДЕЛКИ:</b> {amount:.0f} ₽\n"
@@ -891,27 +982,31 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━\n"
             f"💸 <b>К ОПЛАТЕ:</b> {client_total:.0f} ₽")
     if status == STATUS_REQUISITES_SENT:
-        text += "\n\n📎 <b>Отправьте PDF-чек!</b>\n⚠️ Неоплата = БАН"
+        text += f"\n\n📎 <b>Отправьте PDF-чек!</b>\n{NONPAYMENT_WARNING}"
     elif status == STATUS_PAID:
         text += "\n\n🔍 Чек на проверке."
     elif status == STATUS_COMPLETED:
         text += "\n\n✅ Сделка завершена!"
     text += "\n\n🚫 /cancel — отменить"
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=await get_context_keyboard(user_id))
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(user_id))
 
 @not_banned
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await db.update_last_activity(user_id)
-    if context.user_data.get('step') == ASKING_FEEDBACK_COMMENT:
+    step = context.user_data.get('step')
+    if step == ASKING_FEEDBACK_COMMENT:
         req_id = context.user_data.pop('feedback_req_id', None)
         rating = context.user_data.pop('feedback_rating', None)
         context.user_data.pop('step', None)
         if req_id and rating is not None:
             await db.add_feedback(user_id, req_id, rating, None)
         await update.message.reply_text("✅ Отзыв сохранен.", reply_markup=get_main_keyboard())
+    elif step in (ASKING_AMOUNT, ASKING_LINK, ASKING_COIN):
+        reset_request_flow(context)
+        await update.message.reply_text("❌ Запрос отменён.", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text("Нет активного запроса отзыва.")
+        await update.message.reply_text("Нет активного действия для пропуска.", reply_markup=get_main_keyboard())
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -942,7 +1037,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📞 ПОДДЕРЖКА":
         await update.message.reply_text(f"📞 Поддержка: {SUPPORT_CONTACT}\n\n⚠️ Описывайте вопрос в ОДНОМ сообщении\n⚠️ Указывайте номер заявки\n⚠️ Неоплата = БАН", reply_markup=await get_context_keyboard(user_id))
     elif text == "❓ КАК ОПЛАТИТЬ":
-        await update.message.reply_text("📎 <b>ИНСТРУКЦИЯ</b>\n\n<b>СБП:</b>\n1️⃣ Приложение банка\n2️⃣ «Оплата по номеру телефона»\n3️⃣ Номер из реквизитов\n4️⃣ Точная сумма\n5️⃣ Подтвердить\n\n<b>Карта:</b>\n1️⃣ Приложение банка\n2️⃣ «Перевод по номеру карты»\n3️⃣ Номер карты\n4️⃣ Сумма\n5️⃣ Платёж: «Оплата обмена»\n6️⃣ Подтвердить\n\n📎 Отправьте PDF-чек в чат!", parse_mode="HTML", reply_markup=await get_context_keyboard(user_id))
+        await update.message.reply_text("📎 <b>ИНСТРУКЦИЯ</b>\n\n<b>СБП:</b>\n1️⃣ Приложение банка\n2️⃣ «Оплата по номеру телефона»\n3️⃣ Номер из реквизитов\n4️⃣ Точная сумма\n5️⃣ Подтвердить\n\n<b>Карта:</b>\n1️⃣ Приложение банка\n2️⃣ «Перевод по номеру карты»\n3️⃣ Номер карты\n4️⃣ Сумма\n5️⃣ Платёж: «Оплата обмена»\n6️⃣ Подтвердить\n\n📎 Отправьте PDF-чек в чат!", parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(user_id))
     elif text == "🎁 РЕФЕРАЛЫ":
         await referral_command(update, context)
     elif text == "🔗 ССЫЛКИ":
@@ -955,7 +1050,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data['chat_request_id'] = active['id']
         context.user_data['step'] = ASKING_ADMIN_MESSAGE
-        await update.message.reply_text(f"📝 <b>НАПИСАТЬ ОПЕРАТОРУ</b>\n\n📋 Заявка #{active['id']}\n\nВведите сообщение.\n⚠️ Не более 1 сообщения в 3 минуты\n\n❌ Кнопка меню — отмена.", parse_mode="HTML")
+        await update.message.reply_text(f"📝 <b>НАПИСАТЬ ОПЕРАТОРУ</b>\n\n📋 Заявка #{active['id']}\n\nВведите сообщение.\n⚠️ Не более 1 сообщения в 3 минуты\n\n❌ Кнопка меню — отмена.", parse_mode=ParseMode.HTML)
     elif user_id == ADMIN_ID:
         if text == "📋 ЗАЯВКИ":
             await show_requests_list(update, context)
@@ -968,7 +1063,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>Установить новые:</b>\n"
                 f"/set_usdt [курс] — курс USDT\n"
                 f"/set_btc [курс] — курс BTC",
-                parse_mode="HTML",
+                parse_mode=ParseMode.HTML,
                 reply_markup=get_admin_keyboard()
             )
         elif text == "⚙️ НАСТРОЙКИ":
@@ -987,7 +1082,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     stats = await db.get_client_stats(user_id)
     if not stats or stats['total_deals'] == 0:
-        await update.message.reply_text("👤 <b>ПРОФИЛЬ</b>\n\n📊 Нет завершённых сделок.\n🔥 Нажмите «НОВЫЙ ЗАПРОС»!", parse_mode="HTML", reply_markup=get_main_keyboard())
+        await update.message.reply_text("👤 <b>ПРОФИЛЬ</b>\n\n📊 Нет завершённых сделок.\n🔥 Нажмите «НОВЫЙ ЗАПРОС»!", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         return
     deals = stats['total_deals']
     volume = stats['total_volume']
@@ -1002,7 +1097,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     elif deals < 10: next_rank_name = "Мастер"
     elif deals < 15: next_rank_name = "Легенда"
     next_rank_text = f"📌 До ранга <b>{next_rank_name}</b>: {next_rank_deals} сделок" if next_rank_deals > 0 and next_rank_name else "🏆 Максимальный ранг!"
-    await update.message.reply_text(f"👤 <b>ПРОФИЛЬ</b> | @{stats['username'] or user_id}\n\n🏆 <b>{rank_emoji} {rank_name}</b>\n📊 <code>{progress_bar}</code>\n{next_rank_text}\n\n🎁 Рефералы: {referrals_count}\n🎁 Бесплатных сделок: {free_deals}\n\n📈 Сделок: <b>{deals}</b>\n📈 Объём: <b>{volume:.0f} ₽</b>\n⭐ Рейтинг: <b>{rating:.1f}</b>", parse_mode="HTML", reply_markup=await get_context_keyboard(user_id))
+    await update.message.reply_text(f"👤 <b>ПРОФИЛЬ</b> | @{stats['username'] or user_id}\n\n🏆 <b>{rank_emoji} {rank_name}</b>\n📊 <code>{progress_bar}</code>\n{next_rank_text}\n\n🎁 Рефералы: {referrals_count}\n🎁 Бесплатных сделок: {free_deals}\n\n📈 Сделок: <b>{deals}</b>\n📈 Объём: <b>{volume:.0f} ₽</b>\n⭐ Рейтинг: <b>{rating:.1f}</b>", parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(user_id))
 
 async def show_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = context.user_data.get('reviews_page', 0)
@@ -1058,9 +1153,9 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for req in pending:
             coin = "BTC" if "BTC" in req['operation_type'] else "USDT"
             coin_symbol = "₿" if coin == "BTC" else "🪙"
-            crypto_amount = req['crypto_amount'] if req['crypto_amount'] else 0
-            operator_crypto = req['operator_crypto_amount'] if req['operator_crypto_amount'] else 0
-            service_comm = req['service_commission'] if req['service_commission'] else 0
+            crypto_amount = db.safe_get(req, 'crypto_amount')
+            operator_crypto = db.safe_get(req, 'operator_crypto_amount')
+            service_comm = db.safe_get(req, 'service_commission')
             text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {crypto_amount:.6f} {coin} | ID:{req['user_id']}\n"
             text += f"  💸 К оплате: {req['client_total']:.0f} ₽\n"
             text += f"  👨‍💼 Купить: {operator_crypto:.6f} {coin} | Комиссия: {service_comm:.0f} ₽\n"
@@ -1076,9 +1171,9 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ico = "⏳" if req['status'] == STATUS_PROCESSING else "💳"
             coin = "BTC" if "BTC" in req['operation_type'] else "USDT"
             coin_symbol = "₿" if coin == "BTC" else "🪙"
-            crypto_amount = req['crypto_amount'] if req['crypto_amount'] else 0
-            operator_crypto = req['operator_crypto_amount'] if req['operator_crypto_amount'] else 0
-            service_comm = req['service_commission'] if req['service_commission'] else 0
+            crypto_amount = db.safe_get(req, 'crypto_amount')
+            operator_crypto = db.safe_get(req, 'operator_crypto_amount')
+            service_comm = db.safe_get(req, 'service_commission')
             text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {crypto_amount:.6f} {coin} | {ico}\n"
             text += f"  💸 К оплате: {req['client_total']:.0f} ₽\n"
             text += f"  👨‍💼 Купить: {operator_crypto:.6f} {coin} | Комиссия: {service_comm:.0f} ₽\n"
@@ -1123,6 +1218,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    
+    callback_id = f"{query.message.message_id}_{data}"
+    if await db._is_callback_processed(callback_id):
+        await query.answer("Этот запрос уже обработан.", show_alert=True)
+        return
+    await db._mark_callback_processed(callback_id)
     
     banned, reason = await db.is_banned(user_id)
     if banned:
@@ -1188,6 +1289,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = await db.get_client_stats(user_id)
         deals = stats['total_deals'] if stats else 0
         _, _, discount, _ = get_rank_and_discount(deals)
+        referral_discount = await db.get_first_deal_discount(user_id)
+        total_discount = discount + referral_discount
         free_deals_count = stats['free_deals_count'] if stats else 0
         
         usdt_rate, btc_rate = await db.get_rates()
@@ -1195,8 +1298,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rate = usdt_rate if coin == "USDT" else btc_rate
         
         if free_deals_count > 0:
-            client_total_free, crypto_free, _ = calculate_client_total(amount, discount, True, coin, op_type, usdt_rate, btc_rate)
-            client_total_paid, crypto_paid, _ = calculate_client_total(amount, discount, False, coin, op_type, usdt_rate, btc_rate)
+            client_total_free, crypto_free, _ = calculate_client_total(amount, total_discount, True, coin, op_type, usdt_rate, btc_rate)
+            client_total_paid, crypto_paid, _ = calculate_client_total(amount, total_discount, False, coin, op_type, usdt_rate, btc_rate)
             context.user_data.update({
                 'temp_amount': amount, 'temp_op_type': op_type, 'temp_coin_data': coin_data,
                 'temp_invoice_link': invoice_link,
@@ -1204,10 +1307,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'temp_client_total_without_commission': client_total_free,
                 'pending_free_deal': True
             })
-            await query.edit_message_text(f"🎁 <b>БЕСПЛАТНАЯ СДЕЛКА!</b>\n\n💰 Обычная: {client_total_paid:.0f} ₽\n🎁 Бесплатная: {client_total_free:.0f} ₽", parse_mode="HTML", reply_markup=get_free_deal_keyboard())
+            await query.edit_message_text(f"🎁 <b>БЕСПЛАТНАЯ СДЕЛКА!</b>\n\n💰 Обычная: {client_total_paid:.0f} ₽\n🎁 Бесплатная: {client_total_free:.0f} ₽", parse_mode=ParseMode.HTML, reply_markup=get_free_deal_keyboard())
             return
         
-        client_total, crypto_amount, service_commission = calculate_client_total(amount, discount, False, coin, op_type, usdt_rate, btc_rate)
+        client_total, crypto_amount, service_commission = calculate_client_total(amount, total_discount, False, coin, op_type, usdt_rate, btc_rate)
         operator_crypto, network_fee_crypto, operator_profit = calculate_operator_info(client_total, service_commission, coin, op_type, usdt_rate, btc_rate)
         
         req_id, error = await db.create_request_atomic(user_id, op_type, amount, client_total, crypto_amount, operator_crypto, network_fee_crypto, service_commission, operator_profit, False, invoice_link)
@@ -1216,9 +1319,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         progress_bar, _ = get_status_progress_bar(STATUS_PENDING)
-        msg = f"✅ <b>ЗАЯВКА #{req_id} СОЗДАНА!</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{progress_bar}\n\n⚠️ После получения реквизитов — ОБЯЗАТЕЛЬНАЯ оплата.\n⛔ Неоплата = БАН.\n\n📞 {SUPPORT_CONTACT}"
+        msg = f"✅ <b>ЗАЯВКА #{req_id} СОЗДАНА!</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{progress_bar}\n\n{NONPAYMENT_WARNING}\n\n{SUPPORT_MSG}"
         if invoice_link: msg += f"\n🔗 {html.escape(invoice_link)}"
-        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_cancel_keyboard(req_id))
+        await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_cancel_keyboard(req_id))
         
         admin_msg = (
             f"🔔 <b>НОВАЯ ЗАЯВКА #{req_id}</b>\n\n"
@@ -1234,12 +1337,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"════════════════════════════\n"
             f"👨‍💼 <b>ДЛЯ ОПЕРАТОРА:</b>\n"
             f"════════════════════════════\n"
-            f"💳 Купить на бирже: {client_total:,.0f} ₽ → {operator_crypto:.6f} {coin}\n\n"
+            f"💳 Купить на MEXC: {client_total:,.0f} ₽ → {operator_crypto:.6f} {coin}\n\n"
             f"📊 <b>Распределение:</b>\n"
             f"   • Клиенту: {crypto_amount:.6f} {coin}\n"
         )
         if "Bitpapa" not in op_type:
-            admin_msg += f"   • Комиссия сети: {network_fee_crypto:.6f} {coin}\n"
+            admin_msg += f"   • Комиссия сети MEXC: {network_fee_crypto:.6f} {coin}\n"
         admin_msg += (
             f"   • Комиссия сервиса: {service_commission:,.0f} ₽ ({operator_profit:.6f} {coin})\n\n"
             f"💵 <b>ВЫРУЧКА: {operator_profit:.6f} {coin} ({service_commission:,.0f} ₽)</b>\n"
@@ -1247,7 +1350,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if invoice_link: admin_msg += f"\n🔗 {invoice_link}"
         
-        await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ВЗЯТЬ", callback_data=f"admin_take_{req_id}")], [InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{req_id}")]]))
+        await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ВЗЯТЬ", callback_data=f"admin_take_{req_id}")], [InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{req_id}")]]))
         reset_request_flow(context)
     elif data in ("use_free_deal", "skip_free_deal"):
         if not context.user_data.get('pending_free_deal'):
@@ -1274,15 +1377,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         progress_bar, _ = get_status_progress_bar(STATUS_PENDING)
         free_text = " (БЕСПЛАТНАЯ)" if use_free else ""
-        msg = f"✅ <b>ЗАЯВКА #{req_id}{free_text}</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{progress_bar}\n\n⚠️ Неоплата = БАН.\n📞 {SUPPORT_CONTACT}"
-        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_cancel_keyboard(req_id))
+        msg = f"✅ <b>ЗАЯВКА #{req_id}{free_text}</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{progress_bar}\n\n{NONPAYMENT_WARNING}\n{SUPPORT_MSG}"
+        await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=get_cancel_keyboard(req_id))
         
-        admin_msg = f"🔔 <b>ЗАЯВКА #{req_id}{free_text}</b>\n\n👤 {format_user(query.from_user.username, user_id)}\n📋 {op_type}\n\n👤 Клиент: {amount:.0f} ₽ → {crypto_amount:.6f} {coin}\n💸 К оплате: {client_total:.0f} ₽\n\n👨‍💼 Купить: {operator_crypto:.6f} {coin}\n"
+        admin_msg = f"🔔 <b>ЗАЯВКА #{req_id}{free_text}</b>\n\n👤 {format_user(query.from_user.username, user_id)}\n📋 {op_type}\n\n👤 Клиент: {amount:.0f} ₽ → {crypto_amount:.6f} {coin}\n💸 К оплате: {client_total:.0f} ₽\n\n👨‍💼 Купить на MEXC: {operator_crypto:.6f} {coin}\n"
         if use_free:
             admin_msg += "🎁 <b>БЕСПЛАТНАЯ СДЕЛКА</b> (комиссия сервиса: 0₽)"
         else:
             admin_msg += f"💰 Комиссия сервиса: {service_commission:.0f} ₽"
-        await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ВЗЯТЬ", callback_data=f"admin_take_{req_id}")], [InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{req_id}")]]))
+        await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ВЗЯТЬ", callback_data=f"admin_take_{req_id}")], [InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{req_id}")]]))
         reset_request_flow(context)
     elif data.startswith("admin_take_"):
         if user_id != ADMIN_ID: return
@@ -1294,7 +1397,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.take_request(req_id)
         await query.edit_message_text(f"✅ #{req_id} взята!")
         progress_bar, _ = get_status_progress_bar(STATUS_PROCESSING)
-        await safe_send(context, req['user_id'], f"🔄 <b>ЗАЯВКА #{req_id}</b>\n\n{progress_bar}\n\n👨‍💼 Оператор обрабатывает заявку.\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+        await safe_send(context, req['user_id'], f"🔄 <b>ЗАЯВКА #{req_id}</b>\n\n{progress_bar}\n\n👨‍💼 Оператор обрабатывает заявку.\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
     elif data.startswith("admin_reject_"):
         if user_id != ADMIN_ID: return
         req_id = int(data.split("_")[2])
@@ -1304,7 +1407,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await db.cancel_request(req_id, "admin")
         await query.edit_message_text(f"❌ #{req_id} отклонена!")
-        await safe_send(context, req['user_id'], f"❌ <b>ЗАЯВКА #{req_id} ОТКЛОНЕНА</b>\n\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+        await safe_send(context, req['user_id'], f"❌ <b>ЗАЯВКА #{req_id} ОТКЛОНЕНА</b>\n\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
     elif data.startswith("admin_send_"):
         if user_id != ADMIN_ID: return
         req_id = int(data.split("_")[2])
@@ -1364,16 +1467,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_active = await db.get_last_activity(user_id)
     if last_active and (datetime.now().timestamp() - last_active) > SESSION_TIMEOUT_SECONDS and context.user_data.get('step'):
         reset_request_flow(context)
-        await update.message.reply_text("⏳ Сессия истекла.", parse_mode="HTML", reply_markup=get_main_keyboard())
+        await update.message.reply_text("⏳ Сессия истекла.", parse_mode=ParseMode.HTML, reply_markup=get_main_keyboard())
         return
     
     await db.update_last_activity(user_id)
     
+    step = context.user_data.get('step')
+    
     if update.message.document:
-        if update.message.document.mime_type == 'application/pdf':
+        if step == ASKING_ADMIN_MESSAGE:
+            pass
+        elif update.message.document.mime_type == 'application/pdf':
             active = await db.get_user_active_request(user_id)
             if not active or active['status'] != STATUS_REQUISITES_SENT:
-                await update.message.reply_text(f"❌ Нет заявок в статусе ожидания оплаты.\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+                await update.message.reply_text(f"❌ Нет заявок в статусе ожидания оплаты.\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
                 return
             await db.mark_paid(active['id'], update.message.document.file_id)
             await update.message.reply_text("✅ ЧЕК ПРИНЯТ!\n🔍 Проверка оператором (5–15 минут).")
@@ -1395,13 +1502,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req = await db.get_request(req_id)
         if req:
             await db.save_chat_message_atomic(req['user_id'], req_id, msg_text, 'to_client')
-            await safe_send(context, req['user_id'], f"📨 <b>ОПЕРАТОР</b>\n\n📋 Заявка #{req_id}\n\n{html.escape(msg_text)}\n\n✏️ «📝 НАПИСАТЬ ОПЕРАТОРУ» — ответить", parse_mode="HTML", reply_markup=await get_context_keyboard(req['user_id']))
+            await safe_send(context, req['user_id'], f"📨 <b>ОПЕРАТОР</b>\n\n📋 Заявка #{req_id}\n\n{html.escape(msg_text)}\n\n✏️ «📝 НАПИСАТЬ ОПЕРАТОРУ» — ответить", parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(req['user_id']))
             await update.message.reply_text(f"✅ Отправлено клиенту #{req_id}", reply_markup=get_admin_keyboard())
         else:
             await update.message.reply_text("❌ Заявка не найдена.", reply_markup=get_admin_keyboard())
         return
 
-    if context.user_data.get('step') == ASKING_FEEDBACK_COMMENT:
+    if step == ASKING_FEEDBACK_COMMENT:
         req_id = context.user_data.pop('feedback_req_id', None)
         rating = context.user_data.pop('feedback_rating', None)
         context.user_data.pop('step', None)
@@ -1411,7 +1518,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Спасибо за отзыв!", reply_markup=get_main_keyboard())
         return
 
-    if context.user_data.get('step') == ASKING_ADMIN_MESSAGE:
+    if step == ASKING_ADMIN_MESSAGE:
         if msg_text in MENU_BUTTONS:
             reset_request_flow(context)
             await handle_menu(update, context)
@@ -1429,12 +1536,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         username = format_user(update.effective_user.username, user_id)
-        await context.bot.send_message(ADMIN_ID, f"📨 <b>ОТ КЛИЕНТА</b>\n\n👤 {username}\n📋 #{req_id}\n💬 {html.escape(msg_text)}\n\n✏️ /msg {req_id} [текст]", parse_mode="HTML")
-        await update.message.reply_text("✅ <b>ОТПРАВЛЕНО!</b>\n\nОператор свяжется с вами.\n⏳ Следующее через 3 минуты.", parse_mode="HTML", reply_markup=await get_context_keyboard(user_id))
+        await context.bot.send_message(ADMIN_ID, f"📨 <b>ОТ КЛИЕНТА</b>\n\n👤 {username}\n📋 #{req_id}\n💬 {html.escape(msg_text)}\n\n✏️ /msg {req_id} [текст]", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("✅ <b>ОТПРАВЛЕНО!</b>\n\nОператор свяжется с вами.\n⏳ Следующее через 3 минуты.", parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(user_id))
         context.user_data.pop('step', None)
         return
 
-    if context.user_data.get('step') == ASKING_AMOUNT:
+    if step == ASKING_AMOUNT:
         if msg_text in MENU_BUTTONS:
             reset_request_flow(context)
             await handle_menu(update, context)
@@ -1452,17 +1559,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = await db.get_client_stats(user_id)
             deals = stats['total_deals'] if stats else 0
             _, _, discount, _ = get_rank_and_discount(deals)
+            referral_discount = await db.get_first_deal_discount(user_id)
+            total_discount = discount + referral_discount
             coin_data = context.user_data.get('selected_coin')
             coin = coin_data['code'] if coin_data else "USDT"
             coin_symbol = coin_data['symbol'] if coin_data else "🪙"
             usdt_rate, btc_rate = await db.get_rates()
             rate = usdt_rate if coin == "USDT" else btc_rate
-            client_total, crypto_amount, _ = calculate_client_total(amount, discount, False, coin, op_type, usdt_rate, btc_rate)
-            await update.message.reply_text(f"📝 <b>ПРОВЕРЬТЕ ДАННЫЕ</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_symbol} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n⚠️ После реквизитов — ОБЯЗАТЕЛЬНАЯ оплата.\n⛔ Неоплата = БАН.", parse_mode="HTML", reply_markup=get_confirm_keyboard())
+            client_total, crypto_amount, _ = calculate_client_total(amount, total_discount, False, coin, op_type, usdt_rate, btc_rate)
+            await update.message.reply_text(f"📝 <b>ПРОВЕРЬТЕ ДАННЫЕ</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_symbol} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{NONPAYMENT_WARNING}.", parse_mode=ParseMode.HTML, reply_markup=get_confirm_keyboard())
             context.user_data.pop('step', None)
         return
 
-    if context.user_data.get('step') == ASKING_LINK:
+    if step == ASKING_LINK:
         if msg_text in MENU_BUTTONS:
             reset_request_flow(context)
             await handle_menu(update, context)
@@ -1477,13 +1586,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats = await db.get_client_stats(user_id)
         deals = stats['total_deals'] if stats else 0
         _, _, discount, _ = get_rank_and_discount(deals)
+        referral_discount = await db.get_first_deal_discount(user_id)
+        total_discount = discount + referral_discount
         coin_data = context.user_data.get('selected_coin')
         coin = coin_data['code'] if coin_data else "USDT"
         coin_symbol = coin_data['symbol'] if coin_data else "🪙"
         usdt_rate, btc_rate = await db.get_rates()
         rate = usdt_rate if coin == "USDT" else btc_rate
-        client_total, crypto_amount, _ = calculate_client_total(amount, discount, False, coin, op_type, usdt_rate, btc_rate)
-        await update.message.reply_text(f"📝 <b>ПРОВЕРЬТЕ ДАННЫЕ</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_symbol} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n🔗 {html.escape(link)}\n📌 Курс: ≈{rate:.2f} ₽\n\n⚠️ После реквизитов — ОБЯЗАТЕЛЬНАЯ оплата.\n⛔ Неоплата = БАН.", parse_mode="HTML", reply_markup=get_confirm_keyboard())
+        client_total, crypto_amount, _ = calculate_client_total(amount, total_discount, False, coin, op_type, usdt_rate, btc_rate)
+        await update.message.reply_text(f"📝 <b>ПРОВЕРЬТЕ ДАННЫЕ</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_symbol} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n🔗 {html.escape(link)}\n📌 Курс: ≈{rate:.2f} ₽\n\n{NONPAYMENT_WARNING}.", parse_mode=ParseMode.HTML, reply_markup=get_confirm_keyboard())
         context.user_data.pop('step', None)
         return
 
@@ -1548,7 +1659,7 @@ async def take_request_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await db.take_request(req_id)
     await update.message.reply_text(f"✅ #{req_id} взята!")
     progress_bar, _ = get_status_progress_bar(STATUS_PROCESSING)
-    await safe_send(context, req['user_id'], f"🔄 <b>ЗАЯВКА #{req_id}</b>\n\n{progress_bar}\n\n👨‍💼 Оператор обрабатывает.", parse_mode="HTML")
+    await safe_send(context, req['user_id'], f"🔄 <b>ЗАЯВКА #{req_id}</b>\n\n{progress_bar}\n\n👨‍💼 Оператор обрабатывает.", parse_mode=ParseMode.HTML)
 
 @admin_only
 async def send_requisites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1571,7 +1682,8 @@ async def send_requisites_command(update: Update, context: ContextTypes.DEFAULT_
     rate = btc_rate if coin == "BTC" else usdt_rate
     formatted_reqs = format_requisites(requisites_text, req['client_total'])
     progress_bar, _ = get_status_progress_bar(STATUS_REQUISITES_SENT)
-    await safe_send(context, req['user_id'], f"💳 <b>РЕКВИЗИТЫ #{req_id}</b>\n\n{progress_bar}\n\n{formatted_reqs}\n\n📊 Сумма к оплате: {req['client_total']:.0f} ₽\n{coin_symbol} Вы получите: {(req['crypto_amount'] if req['crypto_amount'] else 0):.6f} {coin}\n📌 Курс: ≈{rate:.2f} ₽\n\n⚠️ Оплатите ТОЧНО указанную сумму.\n📎 Отправьте PDF-чек.\n⛔ Неоплата = БАН.\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+    crypto_amount = db.safe_get(req, 'crypto_amount')
+    await safe_send(context, req['user_id'], f"💳 <b>РЕКВИЗИТЫ #{req_id}</b>\n\n{progress_bar}\n\n{formatted_reqs}\n\n📊 Сумма к оплате: {req['client_total']:.0f} ₽\n{coin_symbol} Вы получите: {crypto_amount:.6f} {coin}\n📌 Курс: ≈{rate:.2f} ₽\n\n{NONPAYMENT_WARNING}\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
     await update.message.reply_text(f"✅ Реквизиты отправлены по #{req_id}")
 
 @admin_only
@@ -1589,7 +1701,7 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Заявка не найдена.")
         return
     await db.save_chat_message_atomic(req['user_id'], req_id, message_text, 'to_client')
-    await safe_send(context, req['user_id'], f"📨 <b>СООБЩЕНИЕ ОТ ОПЕРАТОРА</b>\n\n📋 Заявка #{req_id}\n\n{html.escape(message_text)}\n\n✏️ «📝 НАПИСАТЬ ОПЕРАТОРУ» — ответить", parse_mode="HTML", reply_markup=await get_context_keyboard(req['user_id']))
+    await safe_send(context, req['user_id'], f"📨 <b>СООБЩЕНИЕ ОТ ОПЕРАТОРА</b>\n\n📋 Заявка #{req_id}\n\n{html.escape(message_text)}\n\n✏️ «📝 НАПИСАТЬ ОПЕРАТОРУ» — ответить", parse_mode=ParseMode.HTML, reply_markup=await get_context_keyboard(req['user_id']))
     await update.message.reply_text(f"✅ Отправлено (заявка #{req_id})")
 
 @admin_only
@@ -1611,7 +1723,8 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
     usdt_rate, btc_rate = await db.get_rates()
     rate = btc_rate if coin == "BTC" else usdt_rate
     progress_bar, _ = get_status_progress_bar(STATUS_COMPLETED)
-    await safe_send(context, req['user_id'], f"✅ <b>ЗАЯВКА #{req_id} ЗАВЕРШЕНА!</b>\n\n{progress_bar}\n\n🎉 Сделка завершена!\n\n📊 Сумма: {req['amount']:.0f} ₽\n💸 Оплачено: {req['client_total']:.0f} ₽\n{coin_symbol} Получено: {(req['crypto_amount'] if req['crypto_amount'] else 0):.6f} {coin}\n\n⭐ Оцените сервис!", parse_mode="HTML", reply_markup=get_rating_keyboard(req_id))
+    crypto_amount = db.safe_get(req, 'crypto_amount')
+    await safe_send(context, req['user_id'], f"✅ <b>ЗАЯВКА #{req_id} ЗАВЕРШЕНА!</b>\n\n{progress_bar}\n\n🎉 Сделка завершена!\n\n📊 Сумма: {req['amount']:.0f} ₽\n💸 Оплачено: {req['client_total']:.0f} ₽\n{coin_symbol} Получено: {crypto_amount:.6f} {coin}\n\n⭐ Оцените сервис!", parse_mode=ParseMode.HTML, reply_markup=get_rating_keyboard(req_id))
     await update.message.reply_text(f"✅ #{req_id} завершена!")
 
 @admin_only
@@ -1627,7 +1740,7 @@ async def reject_request_command(update: Update, context: ContextTypes.DEFAULT_T
         req = await db.get_request(req_id)
         await update.message.reply_text(f"❌ #{req_id} отклонена!")
         if req:
-            await safe_send(context, req['user_id'], f"❌ <b>ЗАЯВКА #{req_id} ОТКЛОНЕНА</b>\n\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+            await safe_send(context, req['user_id'], f"❌ <b>ЗАЯВКА #{req_id} ОТКЛОНЕНА</b>\n\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text("❌ Не удалось отклонить.")
 
@@ -1681,7 +1794,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await db.ban_user(user_id, reason)
     await update.message.reply_text(f"🚫 {format_user(None, user_id)} заблокирован.")
-    await safe_send(context, user_id, f"⛔ <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n\nПричина: {reason}\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+    await safe_send(context, user_id, f"⛔ <b>ДОСТУП ЗАБЛОКИРОВАН</b>\n\nПричина: {reason}\n{SUPPORT_MSG}", parse_mode=ParseMode.HTML)
 
 @admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1694,7 +1807,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await db.unban_user(user_id)
     await update.message.reply_text(f"✅ {format_user(None, user_id)} разблокирован.")
-    await safe_send(context, user_id, "✅ <b>ДОСТУП ВОССТАНОВЛЕН</b>\n\n/start", parse_mode="HTML")
+    await safe_send(context, user_id, "✅ <b>ДОСТУП ВОССТАНОВЛЕН</b>\n\n/start", parse_mode=ParseMode.HTML)
 
 @admin_only
 async def edit_rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1743,10 +1856,10 @@ async def reminder_loop(application: Application):
                 user_id = reminder['user_id']
                 client_total = reminder['client_total']
                 if reminders_sent == 0:
-                    message = f"⏰ <b>НАПОМИНАНИЕ</b>\n\n📋 #{request_id}\n💸 К оплате: {client_total:.0f} ₽\n\n⚠️ Отправьте PDF-чек.\n⏳ 15 минут до предупреждения.\n📞 {SUPPORT_CONTACT}"
+                    message = f"⏰ <b>НАПОМИНАНИЕ</b>\n\n📋 #{request_id}\n💸 К оплате: {client_total:.0f} ₽\n\n⚠️ Отправьте PDF-чек.\n⏳ 15 минут до предупреждения.\n{SUPPORT_MSG}"
                 else:
-                    message = f"🚨 <b>ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!</b>\n\n📋 #{request_id}\n💸 К оплате: {client_total:.0f} ₽\n\n⛔ Неоплата = БАН!\n📞 {SUPPORT_CONTACT}"
-                await safe_send(application, user_id, message, parse_mode="HTML")
+                    message = f"🚨 <b>ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!</b>\n\n📋 #{request_id}\n💸 К оплате: {client_total:.0f} ₽\n\n⛔ Неоплата = БАН!\n{SUPPORT_MSG}"
+                await safe_send_bot(application.bot, user_id, message, parse_mode=ParseMode.HTML)
                 await db.update_reminder_sent(request_id)
                 if reminders_sent == 1:
                     await application.bot.send_message(ADMIN_ID, f"⚠️ Второе предупреждение по #{request_id}")
@@ -1763,8 +1876,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
 
 # ================== MAIN ==========================
+async def post_init(application: Application) -> None:
+    asyncio.create_task(reminder_loop(application))
+
 def main() -> None:
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -1793,9 +1914,6 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_message))
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(reminder_loop(application))
 
     application.add_error_handler(error_handler)
 
