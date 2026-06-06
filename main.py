@@ -65,8 +65,6 @@ ASKING_LINK = 2
 ASKING_FEEDBACK_COMMENT = 3
 ASKING_COIN = 4
 ASKING_ADMIN_MESSAGE = 5
-ASKING_USDT_RATE = 6
-ASKING_BTC_RATE = 7
 
 MENU_BUTTONS = {
     "🔥 НОВЫЙ ЗАПРОС", "⭐ ОТЗЫВЫ", "📜 ПРАВИЛА", "👤 ПРОФИЛЬ",
@@ -149,9 +147,7 @@ def get_network_fee(deal_amount_rub: float, coin: str, operation_type: str,
                     usdt_rate: float, btc_rate: float) -> float:
     if "Bitpapa" in operation_type:
         return 0
-    
     amount_usd = deal_amount_rub / usdt_rate
-    
     if coin == "BTC":
         return _get_btc_network_fee(amount_usd, btc_rate)
     elif coin == "USDT":
@@ -177,21 +173,21 @@ def calculate_client_total(amount: float, discount_percent: float = 0.0,
     base_commission_rate = 0.169
     actual_rate = max(0, base_commission_rate - (discount_percent / 100))
     service_commission = max(285, amount * actual_rate)
-    
     client_total = amount + network_fee + service_commission
     crypto_amount = amount / rate
-    
     return client_total, crypto_amount, service_commission
 
-def calculate_operator_crypto(client_total: float, service_commission: float, coin: str,
-                               operation_type: str, usdt_rate: float,
-                               btc_rate: float) -> Tuple[float, float]:
+def calculate_operator_info(client_total: float, service_commission: float,
+                             coin: str, operation_type: str,
+                             usdt_rate: float, btc_rate: float) -> Tuple[float, float, float]:
     rate = usdt_rate if coin == "USDT" else btc_rate
-    total_to_spend = client_total + service_commission
-    operator_crypto_amount = total_to_spend / rate
+    operator_crypto_amount = client_total / rate
+    operator_profit_crypto = service_commission / rate
+    network_fee_rub = get_network_fee(client_total - service_commission - get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate), coin, operation_type, usdt_rate, btc_rate)
+    network_fee_rub = get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate) if abs(client_total - service_commission - get_network_fee(client_total - service_commission, coin, operation_type, usdt_rate, btc_rate)) < 1 else 0
     network_fee_rub = get_network_fee(client_total, coin, operation_type, usdt_rate, btc_rate)
     network_fee_crypto = network_fee_rub / rate
-    return operator_crypto_amount, network_fee_crypto
+    return operator_crypto_amount, network_fee_crypto, operator_profit_crypto
 
 # ================== БД ============================
 class Database:
@@ -228,6 +224,7 @@ class Database:
                 operation_type TEXT, amount REAL, client_total REAL,
                 crypto_amount REAL, operator_crypto_amount REAL,
                 network_fee_crypto REAL, service_commission REAL,
+                operator_profit_crypto REAL,
                 status TEXT, requisites_text TEXT, invoice_link TEXT,
                 created_at TEXT, taken_at TEXT, requisites_sent_at TEXT,
                 paid_at TEXT, completed_at TEXT, cancelled_at TEXT,
@@ -280,13 +277,12 @@ class Database:
     def _migrate_db(self, conn):
         try:
             conn.execute("BEGIN IMMEDIATE")
-            
             cursor = conn.execute("PRAGMA table_info(requests)")
             existing_columns = {column[1] for column in cursor.fetchall()}
             new_cols = {
                 'invoice_link': 'TEXT', 'crypto_amount': 'REAL',
                 'operator_crypto_amount': 'REAL', 'network_fee_crypto': 'REAL',
-                'service_commission': 'REAL'
+                'service_commission': 'REAL', 'operator_profit_crypto': 'REAL'
             }
             for col_name, col_type in new_cols.items():
                 if col_name not in existing_columns:
@@ -296,7 +292,6 @@ class Database:
                     except sqlite3.OperationalError as e:
                         if "duplicate column name" not in str(e).lower():
                             raise
-            
             cursor = conn.execute("PRAGMA table_info(clients)")
             existing_client_columns = {column[1] for column in cursor.fetchall()}
             for col_name, col_type in [('referral_code', 'TEXT'), ('referred_by', 'INTEGER'),
@@ -308,7 +303,6 @@ class Database:
                     except sqlite3.OperationalError as e:
                         if "duplicate column name" not in str(e).lower():
                             raise
-            
             conn.commit()
             logging.info("✅ Миграция БД завершена")
         except Exception as e:
@@ -340,7 +334,7 @@ class Database:
                 (request_id, old_status, new_status, changed_by, datetime.now().isoformat(), comment)
             )
         except Exception as e:
-            logging.error(f"❌ Ошибка логирования события: {e}", exc_info=True)
+            logging.error(f"❌ Ошибка логирования: {e}", exc_info=True)
 
     async def _run_query(self, query: str, params: tuple = ()):
         async with self._lock:
@@ -482,21 +476,18 @@ class Database:
     async def create_request_atomic(self, user_id: int, operation_type: str, amount: float, 
                                      client_total: float, crypto_amount: float,
                                      operator_crypto_amount: float, network_fee_crypto: float,
-                                     service_commission: float, use_free_deal: bool = False,
+                                     service_commission: float, operator_profit_crypto: float,
+                                     use_free_deal: bool = False,
                                      invoice_link: str = None) -> Tuple[Optional[int], str]:
         async with self._lock:
             with self._get_connection() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                    
-                    # Проверка лимита
                     cur = conn.execute("SELECT COUNT(*) as cnt FROM requests WHERE user_id=? AND status IN (?,?,?,?)", 
                                        (user_id, STATUS_PENDING, STATUS_PROCESSING, STATUS_REQUISITES_SENT, STATUS_PAID))
                     if cur.fetchone()['cnt'] >= MAX_ACTIVE_REQUESTS:
                         conn.rollback()
                         return None, f"⚠️ Максимум {MAX_ACTIVE_REQUESTS} активных заявок."
-                    
-                    # Проверка кулдауна
                     cur = conn.execute("SELECT MAX(COALESCE(completed_at, cancelled_at)) as last_action FROM requests WHERE user_id=? AND (status = ? OR status IN (?, ?))", 
                                        (user_id, STATUS_COMPLETED, STATUS_CANCELLED_BY_USER, STATUS_CANCELLED_BY_ADMIN))
                     row = cur.fetchone()
@@ -507,8 +498,6 @@ class Database:
                             conn.rollback()
                             remaining = int(COOLDOWN_SECONDS - time_diff)
                             return None, f"⏳ Подождите {remaining // 60} мин {remaining % 60} сек"
-                    
-                    # Списание бесплатной сделки
                     if use_free_deal:
                         cur = conn.execute("SELECT id FROM free_deals WHERE user_id=? AND used_at IS NULL LIMIT 1", (user_id,))
                         free_deal_row = cur.fetchone()
@@ -521,21 +510,19 @@ class Database:
                             conn.rollback()
                             return None, "❌ Не удалось списать бесплатную сделку."
                         conn.execute("UPDATE clients SET free_deals_count = MAX(0, free_deals_count - 1) WHERE user_id=?", (user_id,))
-                    
-                    # Создание заявки
                     cur = conn.execute("""
                         INSERT INTO requests (user_id, operation_type, amount, client_total, 
                             crypto_amount, operator_crypto_amount, network_fee_crypto,
-                            service_commission, status, created_at, invoice_link)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            service_commission, operator_profit_crypto,
+                            status, created_at, invoice_link)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (user_id, operation_type, amount, client_total, crypto_amount,
                           operator_crypto_amount, network_fee_crypto, service_commission,
+                          operator_profit_crypto,
                           STATUS_PENDING, datetime.now().isoformat(), invoice_link))
                     request_id = cur.lastrowid
-                    
                     conn.execute("INSERT INTO request_events (request_id, old_status, new_status, changed_by, changed_at, comment) VALUES (?, NULL, ?, 'system', ?, 'Заявка создана')", 
                                 (request_id, STATUS_PENDING, datetime.now().isoformat()))
-                    
                     conn.commit()
                     logging.info(f"✅ Заявка #{request_id} создана пользователем {user_id}")
                     return request_id, None
@@ -889,7 +876,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req_id = active['id']
     amount = active['amount']
     client_total = active['client_total']
-    crypto_amount = active.get('crypto_amount', 0)
+    crypto_amount = active['crypto_amount'] if active['crypto_amount'] else 0
     status = active['status']
     operation_type = active['operation_type']
     progress_bar, _ = get_status_progress_bar(status)
@@ -979,8 +966,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• USDT: <b>{usdt_rate} ₽</b>\n"
                 f"• BTC: <b>{btc_rate} ₽</b>\n\n"
                 f"<b>Установить новые:</b>\n"
-                f"/set_usdt <курс> — курс USDT\n"
-                f"/set_btc <курс> — курс BTC",
+                f"/set_usdt [курс] — курс USDT\n"
+                f"/set_btc [курс] — курс BTC",
                 parse_mode="HTML",
                 reply_markup=get_admin_keyboard()
             )
@@ -1071,9 +1058,12 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for req in pending:
             coin = "BTC" if "BTC" in req['operation_type'] else "USDT"
             coin_symbol = "₿" if coin == "BTC" else "🪙"
-            text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {req.get('crypto_amount', 0):.6f} {coin} | ID:{req['user_id']}\n"
+            crypto_amount = req['crypto_amount'] if req['crypto_amount'] else 0
+            operator_crypto = req['operator_crypto_amount'] if req['operator_crypto_amount'] else 0
+            service_comm = req['service_commission'] if req['service_commission'] else 0
+            text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {crypto_amount:.6f} {coin} | ID:{req['user_id']}\n"
             text += f"  💸 К оплате: {req['client_total']:.0f} ₽\n"
-            text += f"  👨‍💼 Купить: {req.get('operator_crypto_amount', 0):.6f} {coin} | Комиссия: {req.get('service_commission', 0):.0f} ₽\n"
+            text += f"  👨‍💼 Купить: {operator_crypto:.6f} {coin} | Комиссия: {service_comm:.0f} ₽\n"
             keyboard_rows.append([
                 InlineKeyboardButton(f"▶️ Взять #{req['id']}", callback_data=f"admin_take_{req['id']}"),
                 InlineKeyboardButton(f"❌ #{req['id']}", callback_data=f"admin_reject_{req['id']}")
@@ -1086,9 +1076,12 @@ async def show_requests_list(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ico = "⏳" if req['status'] == STATUS_PROCESSING else "💳"
             coin = "BTC" if "BTC" in req['operation_type'] else "USDT"
             coin_symbol = "₿" if coin == "BTC" else "🪙"
-            text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {req.get('crypto_amount', 0):.6f} {coin} | {ico}\n"
+            crypto_amount = req['crypto_amount'] if req['crypto_amount'] else 0
+            operator_crypto = req['operator_crypto_amount'] if req['operator_crypto_amount'] else 0
+            service_comm = req['service_commission'] if req['service_commission'] else 0
+            text += f"  #{req['id']} | {req['amount']:.0f} ₽ | {coin_symbol} {crypto_amount:.6f} {coin} | {ico}\n"
             text += f"  💸 К оплате: {req['client_total']:.0f} ₽\n"
-            text += f"  👨‍💼 Купить: {req.get('operator_crypto_amount', 0):.6f} {coin} | Комиссия: {req.get('service_commission', 0):.0f} ₽\n"
+            text += f"  👨‍💼 Купить: {operator_crypto:.6f} {coin} | Комиссия: {service_comm:.0f} ₽\n"
             
             if req['status'] == STATUS_PROCESSING:
                 keyboard_rows.append([
@@ -1215,9 +1208,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         client_total, crypto_amount, service_commission = calculate_client_total(amount, discount, False, coin, op_type, usdt_rate, btc_rate)
-        operator_crypto, network_fee_crypto = calculate_operator_crypto(client_total, service_commission, coin, op_type, usdt_rate, btc_rate)
+        operator_crypto, network_fee_crypto, operator_profit = calculate_operator_info(client_total, service_commission, coin, op_type, usdt_rate, btc_rate)
         
-        req_id, error = await db.create_request_atomic(user_id, op_type, amount, client_total, crypto_amount, operator_crypto, network_fee_crypto, service_commission, False, invoice_link)
+        req_id, error = await db.create_request_atomic(user_id, op_type, amount, client_total, crypto_amount, operator_crypto, network_fee_crypto, service_commission, operator_profit, False, invoice_link)
         if req_id is None:
             await query.edit_message_text(error, reply_markup=get_operation_keyboard())
             return
@@ -1225,13 +1218,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         progress_bar, _ = get_status_progress_bar(STATUS_PENDING)
         msg = f"✅ <b>ЗАЯВКА #{req_id} СОЗДАНА!</b>\n\n📋 {op_type}\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Вы получите: {crypto_amount:.6f} {coin}\n💸 К ОПЛАТЕ: {client_total:.0f} ₽\n📌 Курс: ≈{rate:.2f} ₽\n\n{progress_bar}\n\n⚠️ После получения реквизитов — ОБЯЗАТЕЛЬНАЯ оплата.\n⛔ Неоплата = БАН.\n\n📞 {SUPPORT_CONTACT}"
         if invoice_link: msg += f"\n🔗 {html.escape(invoice_link)}"
-        
         await query.edit_message_text(msg, parse_mode="HTML", reply_markup=get_cancel_keyboard(req_id))
         
-        admin_msg = f"🔔 <b>НОВАЯ ЗАЯВКА #{req_id}</b>\n\n👤 {format_user(query.from_user.username, user_id)}\n📋 {op_type}\n\n👤 <b>ДЛЯ КЛИЕНТА:</b>\n💰 Сумма сделки: {amount:.0f} ₽\n{coin_data['symbol']} Получит: {crypto_amount:.6f} {coin}\n💸 К оплате: {client_total:.0f} ₽\n\n👨‍💼 <b>ДЛЯ ОПЕРАТОРА:</b>\n💳 Купить: {operator_crypto:.6f} {coin}\n📊 Комиссия сервиса: {service_commission:.0f} ₽"
+        admin_msg = (
+            f"🔔 <b>НОВАЯ ЗАЯВКА #{req_id}</b>\n\n"
+            f"👤 Клиент: {format_user(query.from_user.username, user_id)}\n"
+            f"📋 Тип: {op_type}\n\n"
+            f"════════════════════════════\n"
+            f"👤 <b>ДЛЯ КЛИЕНТА:</b>\n"
+            f"════════════════════════════\n"
+            f"💰 Сумма сделки: {amount:,.0f} ₽\n"
+            f"{coin_data['symbol']} Получит: {crypto_amount:.6f} {coin}\n"
+            f"💸 К оплате: {client_total:,.0f} ₽ ({operator_crypto:.6f} {coin})\n"
+            f"📌 Курс: {rate:.2f} ₽\n\n"
+            f"════════════════════════════\n"
+            f"👨‍💼 <b>ДЛЯ ОПЕРАТОРА:</b>\n"
+            f"════════════════════════════\n"
+            f"💳 Купить на бирже: {client_total:,.0f} ₽ → {operator_crypto:.6f} {coin}\n\n"
+            f"📊 <b>Распределение:</b>\n"
+            f"   • Клиенту: {crypto_amount:.6f} {coin}\n"
+        )
         if "Bitpapa" not in op_type:
-            admin_msg += f"\n📊 Комиссия сети: {network_fee_crypto:.6f} {coin}"
-        admin_msg += f"\n💵 Прибыль: {service_commission:.0f} ₽"
+            admin_msg += f"   • Комиссия сети: {network_fee_crypto:.6f} {coin}\n"
+        admin_msg += (
+            f"   • Комиссия сервиса: {service_commission:,.0f} ₽ ({operator_profit:.6f} {coin})\n\n"
+            f"💵 <b>ВЫРУЧКА: {operator_profit:.6f} {coin} ({service_commission:,.0f} ₽)</b>\n"
+            f"════════════════════════════"
+        )
         if invoice_link: admin_msg += f"\n🔗 {invoice_link}"
         
         await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ ВЗЯТЬ", callback_data=f"admin_take_{req_id}")], [InlineKeyboardButton("❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{req_id}")]]))
@@ -1252,9 +1265,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rate = usdt_rate if coin == "USDT" else btc_rate
         
         _, crypto_amount, service_commission = calculate_client_total(amount, 0, use_free, coin, op_type, usdt_rate, btc_rate)
-        operator_crypto, network_fee_crypto = calculate_operator_crypto(client_total, service_commission, coin, op_type, usdt_rate, btc_rate)
+        operator_crypto, network_fee_crypto, operator_profit = calculate_operator_info(client_total, service_commission, coin, op_type, usdt_rate, btc_rate)
         
-        req_id, error = await db.create_request_atomic(user_id, op_type, amount, client_total, crypto_amount, operator_crypto, network_fee_crypto, service_commission, use_free, invoice_link)
+        req_id, error = await db.create_request_atomic(user_id, op_type, amount, client_total, crypto_amount, operator_crypto, network_fee_crypto, service_commission, operator_profit, use_free, invoice_link)
         if req_id is None:
             await query.edit_message_text(error, reply_markup=get_operation_keyboard())
             return
@@ -1296,12 +1309,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_id != ADMIN_ID: return
         req_id = int(data.split("_")[2])
         context.user_data['admin_send_req_id'] = req_id
-        await query.edit_message_text(f"📝 Введите реквизиты для заявки #{req_id}:\n\n/send {req_id} <реквизиты>")
+        await query.edit_message_text(f"📝 Введите реквизиты для заявки #{req_id}:\n\n/send {req_id} [реквизиты]")
     elif data.startswith("admin_msg_"):
         if user_id != ADMIN_ID: return
         req_id = int(data.split("_")[2])
         context.user_data['admin_msg_req_id'] = req_id
-        await query.edit_message_text(f"💬 Введите сообщение для заявки #{req_id}:\n\n/msg {req_id} <текст>")
+        await query.edit_message_text(f"💬 Введите сообщение для заявки #{req_id}:\n\n/msg {req_id} [текст]")
     elif data.startswith("admin_getpdf_"):
         if user_id != ADMIN_ID: return
         req_id = int(data.split("_")[2])
@@ -1416,7 +1429,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         username = format_user(update.effective_user.username, user_id)
-        await context.bot.send_message(ADMIN_ID, f"📨 <b>ОТ КЛИЕНТА</b>\n\n👤 {username}\n📋 #{req_id}\n💬 {html.escape(msg_text)}\n\n✏️ /msg {req_id} <текст>", parse_mode="HTML")
+        await context.bot.send_message(ADMIN_ID, f"📨 <b>ОТ КЛИЕНТА</b>\n\n👤 {username}\n📋 #{req_id}\n💬 {html.escape(msg_text)}\n\n✏️ /msg {req_id} [текст]", parse_mode="HTML")
         await update.message.reply_text("✅ <b>ОТПРАВЛЕНО!</b>\n\nОператор свяжется с вами.\n⏳ Следующее через 3 минуты.", parse_mode="HTML", reply_markup=await get_context_keyboard(user_id))
         context.user_data.pop('step', None)
         return
@@ -1498,33 +1511,31 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def set_usdt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /set_usdt <курс>\nПример: /set_usdt 92.5")
+        await update.message.reply_text("❌ /set_usdt [курс]\nПример: /set_usdt 92.5")
         return
     try:
         rate = float(context.args[0].replace(",", "."))
         await db.update_setting('usdt_rate', str(rate))
         await update.message.reply_text(f"✅ Курс USDT обновлен: {rate} ₽")
-        logging.info(f"USDT rate updated to {rate}")
     except ValueError:
         await update.message.reply_text("❌ Неверный формат числа.")
 
 @admin_only
 async def set_btc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /set_btc <курс>\nПример: /set_btc 5500000")
+        await update.message.reply_text("❌ /set_btc [курс]\nПример: /set_btc 5500000")
         return
     try:
         rate = float(context.args[0].replace(",", "."))
         await db.update_setting('btc_rate', str(rate))
         await update.message.reply_text(f"✅ Курс BTC обновлен: {rate} ₽")
-        logging.info(f"BTC rate updated to {rate}")
     except ValueError:
         await update.message.reply_text("❌ Неверный формат числа.")
 
 @admin_only
 async def take_request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /take <id>")
+        await update.message.reply_text("❌ /take [id]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1542,7 +1553,7 @@ async def take_request_command(update: Update, context: ContextTypes.DEFAULT_TYP
 @admin_only
 async def send_requisites_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /send <id> <реквизиты>")
+        await update.message.reply_text("❌ /send [id] [реквизиты]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1560,13 +1571,13 @@ async def send_requisites_command(update: Update, context: ContextTypes.DEFAULT_
     rate = btc_rate if coin == "BTC" else usdt_rate
     formatted_reqs = format_requisites(requisites_text, req['client_total'])
     progress_bar, _ = get_status_progress_bar(STATUS_REQUISITES_SENT)
-    await safe_send(context, req['user_id'], f"💳 <b>РЕКВИЗИТЫ #{req_id}</b>\n\n{progress_bar}\n\n{formatted_reqs}\n\n📊 Сумма к оплате: {req['client_total']:.0f} ₽\n{coin_symbol} Вы получите: {req.get('crypto_amount', 0):.6f} {coin}\n📌 Курс: ≈{rate:.2f} ₽\n\n⚠️ Оплатите ТОЧНО указанную сумму.\n📎 Отправьте PDF-чек.\n⛔ Неоплата = БАН.\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
+    await safe_send(context, req['user_id'], f"💳 <b>РЕКВИЗИТЫ #{req_id}</b>\n\n{progress_bar}\n\n{formatted_reqs}\n\n📊 Сумма к оплате: {req['client_total']:.0f} ₽\n{coin_symbol} Вы получите: {(req['crypto_amount'] if req['crypto_amount'] else 0):.6f} {coin}\n📌 Курс: ≈{rate:.2f} ₽\n\n⚠️ Оплатите ТОЧНО указанную сумму.\n📎 Отправьте PDF-чек.\n⛔ Неоплата = БАН.\n📞 {SUPPORT_CONTACT}", parse_mode="HTML")
     await update.message.reply_text(f"✅ Реквизиты отправлены по #{req_id}")
 
 @admin_only
 async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /msg <id_заявки> <текст>")
+        await update.message.reply_text("❌ /msg [id] [текст]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1584,7 +1595,7 @@ async def msg_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /confirm <id>")
+        await update.message.reply_text("❌ /confirm [id]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1600,13 +1611,13 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
     usdt_rate, btc_rate = await db.get_rates()
     rate = btc_rate if coin == "BTC" else usdt_rate
     progress_bar, _ = get_status_progress_bar(STATUS_COMPLETED)
-    await safe_send(context, req['user_id'], f"✅ <b>ЗАЯВКА #{req_id} ЗАВЕРШЕНА!</b>\n\n{progress_bar}\n\n🎉 Сделка завершена!\n\n📊 Сумма: {req['amount']:.0f} ₽\n💸 Оплачено: {req['client_total']:.0f} ₽\n{coin_symbol} Получено: {req.get('crypto_amount', 0):.6f} {coin}\n\n⭐ Оцените сервис!", parse_mode="HTML", reply_markup=get_rating_keyboard(req_id))
+    await safe_send(context, req['user_id'], f"✅ <b>ЗАЯВКА #{req_id} ЗАВЕРШЕНА!</b>\n\n{progress_bar}\n\n🎉 Сделка завершена!\n\n📊 Сумма: {req['amount']:.0f} ₽\n💸 Оплачено: {req['client_total']:.0f} ₽\n{coin_symbol} Получено: {(req['crypto_amount'] if req['crypto_amount'] else 0):.6f} {coin}\n\n⭐ Оцените сервис!", parse_mode="HTML", reply_markup=get_rating_keyboard(req_id))
     await update.message.reply_text(f"✅ #{req_id} завершена!")
 
 @admin_only
 async def reject_request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /reject <id>")
+        await update.message.reply_text("❌ /reject [id]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1623,7 +1634,7 @@ async def reject_request_command(update: Update, context: ContextTypes.DEFAULT_T
 @admin_only
 async def get_pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /getpdf <id>")
+        await update.message.reply_text("❌ /getpdf [id]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1638,7 +1649,7 @@ async def get_pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def get_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /getlink <id>")
+        await update.message.reply_text("❌ /getlink [id]")
         return
     try: req_id = int(context.args[0])
     except ValueError:
@@ -1653,7 +1664,7 @@ async def get_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ /ban <id или @username> <причина>")
+        await update.message.reply_text("❌ /ban [id или @username] [причина]")
         return
     identifier = context.args[0]
     reason = " ".join(context.args[1:])
@@ -1675,7 +1686,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /unban <id>")
+        await update.message.reply_text("❌ /unban [id]")
         return
     try: user_id = int(context.args[0])
     except ValueError:
